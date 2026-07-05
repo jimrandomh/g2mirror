@@ -39,12 +39,30 @@ pub struct View {
     pub simulated: bool,
 }
 
+/// Parser callbacks that count audible bells. Counting through the parser
+/// (rather than scanning for 0x07) avoids false positives from BEL used as
+/// an OSC string terminator (e.g. window-title sequences).
+#[derive(Default)]
+struct BellCounter {
+    bells: usize,
+}
+
+impl vt100::Callbacks for BellCounter {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.bells += 1;
+    }
+}
+
+fn new_parser(rows: u16, cols: u16) -> vt100::Parser<BellCounter> {
+    vt100::Parser::new_with_callbacks(rows, cols, 0, BellCounter::default())
+}
+
 pub struct Mirror {
     host_rows: u16,
     host_cols: u16,
     /// Screen model of the child's output, always sized to the child's
     /// current dimensions (host size normally, view size while viewing).
-    parser: vt100::Parser,
+    parser: vt100::Parser<BellCounter>,
     view: Option<View>,
 }
 
@@ -54,6 +72,8 @@ pub struct Output {
     pub host: Vec<u8>,
     /// Bytes for the viewing device (present only while viewing).
     pub remote: Option<Vec<u8>>,
+    /// Number of audible bells in this chunk.
+    pub bells: usize,
 }
 
 /// What the event loop should do after a state change.
@@ -71,7 +91,7 @@ impl Mirror {
         Self {
             host_rows,
             host_cols,
-            parser: vt100::Parser::new(host_rows, host_cols, 0),
+            parser: new_parser(host_rows, host_cols),
             view: None,
         }
     }
@@ -88,20 +108,27 @@ impl Mirror {
                 Output {
                     host: bytes.to_vec(),
                     remote: None,
+                    bells: self.take_bells(),
                 }
             }
             Some(_) => {
                 let prev = self.parser.screen().clone();
                 self.parser.process(bytes);
+                let bells = self.take_bells();
                 let screen = self.parser.screen();
                 Output {
                     host: render_rows(screen, &prev, self.host_rows, self.host_cols, false),
                     // The device terminal is exactly view-sized, so the
                     // same-size diff stream is correct for it.
                     remote: Some(screen.state_diff(&prev)),
+                    bells,
                 }
             }
         }
+    }
+
+    fn take_bells(&mut self) -> usize {
+        std::mem::take(&mut self.parser.callbacks_mut().bells)
     }
 
     /// A device started viewing: resize the child to the device dimensions
@@ -116,7 +143,7 @@ impl Mirror {
         // Rebuild the model at device dimensions, primed with the snapshot,
         // so subsequent diffs (for both destinations) start from what the
         // device and host are actually displaying.
-        let mut parser = vt100::Parser::new(view.rows, view.cols, 0);
+        let mut parser = new_parser(view.rows, view.cols);
         parser.process(&snapshot);
         self.parser = parser;
         self.view = Some(view);
@@ -134,7 +161,7 @@ impl Mirror {
     /// simulated toggle): back to pass-through at host dimensions.
     pub fn end_view(&mut self) -> Transition {
         self.view = None;
-        self.parser = vt100::Parser::new(self.host_rows, self.host_cols, 0);
+        self.parser = new_parser(self.host_rows, self.host_cols);
         // The child's SIGWINCH repaint will fill the host screen; reset any
         // input modes we enabled on the child's behalf, since from here on
         // the child manages the host terminal directly.
@@ -462,6 +489,21 @@ mod tests {
         host.process(&t.host_output);
         assert!(!host.screen().bracketed_paste());
         assert!(mirror.view().is_none());
+    }
+
+    #[test]
+    fn bells_are_counted_in_both_modes() {
+        let mut mirror = Mirror::new(24, 80);
+        assert_eq!(mirror.process(b"quiet output").bells, 0);
+        assert_eq!(mirror.process(b"ding\x07dong\x07").bells, 2);
+        // BEL as an OSC string terminator is not a bell.
+        assert_eq!(mirror.process(b"\x1b]0;window title\x07").bells, 0);
+        // Counter resets between chunks.
+        assert_eq!(mirror.process(b"still quiet").bells, 0);
+
+        let mut host = term(24, 80);
+        start_view(&mut mirror, &mut host);
+        assert_eq!(mirror.process(b"viewing\x07").bells, 1);
     }
 
     #[test]

@@ -23,7 +23,11 @@ truncated.
   --init-config`, which prints the auth token once), cleans up stale
   session sockets, authenticates devices, lists sessions, and relays
   messages. It listens on a private address (loopback by default);
-  encryption is delegated to tailscale or an ssh tunnel.
+  encryption is delegated to tailscale or an ssh tunnel. It also keeps a
+  monitor connection to every session and tracks each terminal's last
+  bell, pushing debounced bell notifications to connected devices — useful
+  for watching AI agents and other long-running programs that ring the
+  terminal bell (`printf '\a'`) when they want attention.
 
 See [PROTOCOL.md](PROTOCOL.md) for the full protocol (aimed at glasses-
 driver implementers). Keyboard input from the device is not yet supported.

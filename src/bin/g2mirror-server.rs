@@ -5,7 +5,9 @@
 //! address (from config.json) and tunnel as needed. Devices authenticate
 //! with a token whose SHA-256 hash is stored in the config.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -17,6 +19,41 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
+/// How often to scan ~/.g2mirror for new session sockets to monitor.
+const MONITOR_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bell tracking, shared between the monitor tasks (one per session socket,
+/// connected regardless of whether any device is attached) and the device
+/// connections.
+struct BellState {
+    /// Session socket name -> last bell (unix ms), if one has rung since
+    /// the server started monitoring that terminal.
+    terminals: std::sync::Mutex<HashMap<String, Option<u64>>>,
+    /// Socket names that currently have a live monitor task.
+    monitored: std::sync::Mutex<HashSet<String>>,
+    /// Bell events (socket name, unix ms) fanned out to device connections.
+    bell_tx: tokio::sync::broadcast::Sender<(String, u64)>,
+}
+
+impl BellState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            terminals: std::sync::Mutex::new(HashMap::new()),
+            monitored: std::sync::Mutex::new(HashSet::new()),
+            bell_tx: tokio::sync::broadcast::channel(256).0,
+        })
+    }
+
+    fn last_bell_at(&self, socket: &str) -> Option<u64> {
+        self.terminals
+            .lock()
+            .unwrap()
+            .get(socket)
+            .copied()
+            .flatten()
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Config {
@@ -107,14 +144,17 @@ fn serve() -> anyhow::Result<()> {
             })?;
         // Parsed by tooling; keep the format stable.
         println!("g2mirror-server listening on {}", listener.local_addr()?);
-        let config = std::sync::Arc::new(config);
-        let dir = std::sync::Arc::new(dir);
+        let config = Arc::new(config);
+        let dir = Arc::new(dir);
+        let state = BellState::new();
+        tokio::spawn(monitor_manager((*dir).clone(), state.clone()));
         loop {
             let (stream, peer) = listener.accept().await?;
             let config = config.clone();
             let dir = dir.clone();
+            let state = state.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_device(stream, &config, &dir).await {
+                if let Err(e) = handle_device(stream, &config, &dir, &state).await {
                     eprintln!("connection from {peer}: {e:#}");
                 }
             });
@@ -122,7 +162,72 @@ fn serve() -> anyhow::Result<()> {
     })
 }
 
-async fn handle_device(stream: TcpStream, config: &Config, dir: &Path) -> anyhow::Result<()> {
+/// Keep a monitor connection open to every live session socket so bells are
+/// tracked regardless of device connections. These connections don't count
+/// as viewers on the wrapper side.
+async fn monitor_manager(dir: PathBuf, state: Arc<BellState>) {
+    loop {
+        let live = live_session_sockets(&dir);
+        {
+            let mut terminals = state.terminals.lock().unwrap();
+            // Forget terminals whose socket is gone; remember new ones.
+            terminals.retain(|name, _| live.contains(name));
+            for name in &live {
+                terminals.entry(name.clone()).or_insert(None);
+            }
+        }
+        for name in live {
+            if state.monitored.lock().unwrap().insert(name.clone()) {
+                tokio::spawn(monitor_session(dir.join(&name), name, state.clone()));
+            }
+        }
+        tokio::time::sleep(MONITOR_SCAN_INTERVAL).await;
+    }
+}
+
+async fn monitor_session(path: PathBuf, name: String, state: Arc<BellState>) {
+    let _ = run_monitor(&path, &name, &state).await;
+    // On any exit (wrapper gone, I/O error) release the slot; the next scan
+    // reconnects if the socket still exists.
+    state.monitored.lock().unwrap().remove(&name);
+}
+
+async fn run_monitor(path: &Path, name: &str, state: &BellState) -> anyhow::Result<()> {
+    let stream = UnixStream::connect(path).await?;
+    let mut conn = SessionConn {
+        stream,
+        buf: Vec::new(),
+    };
+    conn.send_line(
+        &serde_json::json!({"type": "monitor", "version": PROTOCOL_VERSION}).to_string(),
+    )
+    .await?;
+    while let Some(line) = conn.next_line().await? {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        // Ignore everything except bells (e.g. the connect greeting).
+        if msg.get("type").and_then(|t| t.as_str()) == Some("bell")
+            && let Some(at) = msg.get("at").and_then(serde_json::Value::as_u64)
+        {
+            state
+                .terminals
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), Some(at));
+            // Errors just mean no device is connected right now.
+            let _ = state.bell_tx.send((name.to_string(), at));
+        }
+    }
+    Ok(())
+}
+
+async fn handle_device(
+    stream: TcpStream,
+    config: &Config,
+    dir: &Path,
+    state: &BellState,
+) -> anyhow::Result<()> {
     let mut ws = tokio_tungstenite::accept_async(stream)
         .await
         .context("websocket handshake failed")?;
@@ -156,12 +261,13 @@ async fn handle_device(stream: TcpStream, config: &Config, dir: &Path) -> anyhow
     .await?;
 
     let mut session: Option<SessionConn> = None;
+    let mut bell_rx = state.bell_tx.subscribe();
     loop {
         tokio::select! {
             msg = ws.next() => {
                 let Some(msg) = msg else { break };
                 let Message::Text(text) = msg? else { continue };
-                handle_device_message(&text, &mut ws, &mut session, &init, dir).await?;
+                handle_device_message(&text, &mut ws, &mut session, &init, dir, state).await?;
             }
             line = async { session.as_mut().unwrap().next_line().await },
                     if session.is_some() => {
@@ -176,6 +282,16 @@ async fn handle_device(stream: TcpStream, config: &Config, dir: &Path) -> anyhow
                     }
                 }
             }
+            // A terminal rang its bell (viewed or not): notify the device.
+            ev = bell_rx.recv() => {
+                if let Ok((socket, at)) = ev {
+                    send(&mut ws, &ServerToDevice::Bell {
+                        socket,
+                        last_bell_at: at,
+                    }).await?;
+                }
+                // Lagged receivers just miss old events; `list` resyncs.
+            }
         }
     }
     Ok(())
@@ -187,6 +303,7 @@ async fn handle_device_message(
     session: &mut Option<SessionConn>,
     init: &DeviceInit,
     dir: &Path,
+    state: &BellState,
 ) -> anyhow::Result<()> {
     let parsed: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -202,7 +319,7 @@ async fn handle_device_message(
     };
     match parsed.get("type").and_then(|t| t.as_str()) {
         Some("list") => {
-            let sessions = list_sessions(dir);
+            let sessions = list_sessions(dir, state);
             send(ws, &ServerToDevice::Sessions { sessions }).await
         }
         Some("connect") => {
@@ -276,32 +393,32 @@ async fn handle_device_message(
     }
 }
 
-/// Sessions whose socket file looks valid and whose wrapper PID is alive.
-fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
+/// Session socket names whose file looks valid and whose wrapper PID is
+/// alive.
+fn live_session_sockets(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut sessions = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !paths::is_valid_socket_name(name) {
-            continue;
-        }
-        let Some(pid) = paths::socket_pid(name) else {
-            continue;
-        };
-        if !paths::pid_exists(pid) {
-            continue;
-        }
-        let cwd_hint = name.split_once('-').map(|(_, p)| p).unwrap_or("");
-        sessions.push(SessionInfo {
-            socket: name.to_string(),
-            pid,
-            cwd_hint: cwd_hint.to_string(),
-        });
-    }
-    sessions
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| {
+            paths::is_valid_socket_name(name)
+                && paths::socket_pid(name).is_some_and(paths::pid_exists)
+        })
+        .collect()
+}
+
+fn list_sessions(dir: &Path, state: &BellState) -> Vec<SessionInfo> {
+    live_session_sockets(dir)
+        .into_iter()
+        .map(|name| SessionInfo {
+            pid: paths::socket_pid(&name).unwrap_or(0),
+            cwd_hint: name.split_once('-').map(|(_, p)| p).unwrap_or("").to_string(),
+            last_bell_at: state.last_bell_at(&name),
+            socket: name,
+        })
+        .collect()
 }
 
 /// A connection to a wrapper's session socket, speaking newline-delimited

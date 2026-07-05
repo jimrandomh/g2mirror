@@ -53,6 +53,55 @@ pub enum ClientState {
     Viewing,
 }
 
+/// Debounces bell notifications to at most one per window: the first bell
+/// is reported immediately (leading edge); bells during the window are
+/// coalesced into one report when the window expires (trailing edge), so
+/// the latest bell timestamp is never lost.
+pub struct BellDebouncer {
+    window: std::time::Duration,
+    last_sent: Option<std::time::Instant>,
+    pending_at: Option<u64>,
+}
+
+impl BellDebouncer {
+    pub fn new(window: std::time::Duration) -> Self {
+        Self {
+            window,
+            last_sent: None,
+            pending_at: None,
+        }
+    }
+
+    /// A bell rang at `at` (unix epoch ms). Returns `Some(at)` if it should
+    /// be reported now; otherwise it is held for the trailing edge.
+    pub fn on_bell(&mut self, now: std::time::Instant, at: u64) -> Option<u64> {
+        match self.last_sent {
+            Some(sent) if now.duration_since(sent) < self.window => {
+                self.pending_at = Some(at);
+                None
+            }
+            _ => {
+                self.last_sent = Some(now);
+                Some(at)
+            }
+        }
+    }
+
+    /// When (on the monotonic clock) a held bell should be reported, if any.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.pending_at
+            .and(self.last_sent)
+            .map(|sent| sent + self.window)
+    }
+
+    /// Report the held bell (call when the deadline expires).
+    pub fn fire(&mut self, now: std::time::Instant) -> Option<u64> {
+        let at = self.pending_at.take()?;
+        self.last_sent = Some(now);
+        Some(at)
+    }
+}
+
 pub struct Client {
     stream: UnixStream,
     /// Bytes read but not yet consumed as complete lines.
@@ -108,5 +157,39 @@ impl Client {
             .await
             .context("client stalled")??;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bell_debounce_leading_and_trailing_edge() {
+        let mut d = BellDebouncer::new(Duration::from_secs(3));
+        let t0 = Instant::now();
+
+        // First bell reports immediately.
+        assert_eq!(d.on_bell(t0, 1000), Some(1000));
+        assert_eq!(d.deadline(), None);
+
+        // Bells inside the window are held; the latest timestamp wins.
+        assert_eq!(d.on_bell(t0 + Duration::from_millis(500), 1500), None);
+        assert_eq!(d.on_bell(t0 + Duration::from_millis(900), 1900), None);
+        let deadline = d.deadline().expect("trailing edge must be scheduled");
+        assert_eq!(deadline, t0 + Duration::from_secs(3));
+
+        // The trailing edge reports the held bell exactly once.
+        assert_eq!(d.fire(deadline), Some(1900));
+        assert_eq!(d.deadline(), None);
+        assert_eq!(d.fire(deadline), None);
+
+        // The trailing report restarts the window...
+        assert_eq!(d.on_bell(deadline + Duration::from_secs(1), 5000), None);
+        // ...and a bell after a quiet window reports immediately again.
+        let mut d = BellDebouncer::new(Duration::from_secs(3));
+        assert_eq!(d.on_bell(t0, 1000), Some(1000));
+        assert_eq!(d.on_bell(t0 + Duration::from_secs(4), 9000), Some(9000));
     }
 }

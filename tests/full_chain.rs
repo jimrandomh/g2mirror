@@ -51,7 +51,9 @@ async fn device_views_real_session_through_server() {
         .args([
             "sh",
             "-c",
-            "trap 'stty size' WINCH; printf 'chain-marker\\n'; for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.3; done",
+            // Rings the bell after ~1s, once the device is connected.
+            "trap 'stty size' WINCH; printf 'chain-marker\\n'; sleep 1; printf '\\a'; \
+             for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.3; done",
         ])
         .env("G2MIRROR_DIR", &dir)
         .current_dir("/")
@@ -129,18 +131,27 @@ async fn device_views_real_session_through_server() {
     device.process(&b64.decode(snapshot["data"].as_str().unwrap()).unwrap());
     assert!(device.screen().contents().contains("chain-marker"));
 
+    // Keep applying output until the app has both repainted at the device
+    // size (proving SIGWINCH crossed the chain) and rung its bell (proving
+    // bell notifications cross it too, independent of the view stream).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !device.screen().contents().contains("24 96") {
+    let mut bell: Option<Value> = None;
+    while !device.screen().contents().contains("24 96") || bell.is_none() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "app never reported the device size; screen:\n{}",
+            "missing resize repaint or bell; screen:\n{}",
             device.screen().contents()
         );
         let msg = recv(&mut ws).await;
-        if msg["type"] == "output" {
-            device.process(&b64.decode(msg["data"].as_str().unwrap()).unwrap());
+        match msg["type"].as_str().unwrap() {
+            "output" => device.process(&b64.decode(msg["data"].as_str().unwrap()).unwrap()),
+            "bell" => bell = Some(msg),
+            _ => {}
         }
     }
+    let bell = bell.unwrap();
+    assert_eq!(bell["socket"].as_str().unwrap(), socket);
+    assert!(bell["last_bell_at"].as_u64().unwrap() > 0);
 
     wrapper.kill().await.ok();
     server.kill().await.ok();

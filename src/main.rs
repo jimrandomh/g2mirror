@@ -19,11 +19,21 @@ use g2mirror::protocol::{self, FromSession, ToSession, PROTOCOL_VERSION};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::signal::unix::{signal, SignalKind};
 
-use control::{Client, ClientState, ControlListener};
+use control::{BellDebouncer, Client, ClientState, ControlListener};
 use mirror::{Mirror, View};
 
 /// Ctrl+G: simulate a device connect/disconnect.
 const HOTKEY: u8 = 0x07;
+
+/// Bell notifications are debounced to at most one per this window.
+const BELL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
@@ -94,7 +104,14 @@ async fn run(
     let mut winch = signal(SignalKind::window_change())?;
 
     let mut mirror = Mirror::new(host_rows, host_cols);
-    let mut client: Option<Client> = None;
+    // Connection slots: a freshly accepted connection is `pending` until its
+    // first message classifies it as the viewer (a device, via init) or the
+    // monitor (g2mirror-server, via monitor). One of each at a time; the
+    // monitor does not count as a viewer.
+    let mut pending: Option<Client> = None;
+    let mut viewer: Option<Client> = None;
+    let mut monitor: Option<Client> = None;
+    let mut bell = BellDebouncer::new(BELL_DEBOUNCE);
     let mut stdin_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 64 * 1024];
     let mut stdin_open = true;
@@ -117,8 +134,8 @@ async fn run(
                 Err(e) => return Err(e).context("error reading stdin"),
             },
 
-            // Child output: translate through the mirror; repaint the host
-            // and stream to a viewing client.
+            // Child output: translate through the mirror; repaint the host,
+            // stream to a viewing client, report bells to the monitor.
             n = pty_read.read(&mut pty_buf) => match n {
                 // EOF/EIO on the pty master means the child side is gone.
                 Ok(0) | Err(_) => break child.wait().await?,
@@ -126,18 +143,34 @@ async fn run(
                     let out = mirror.process(&pty_buf[..n]);
                     stdout.write_all(&out.host).await?;
                     stdout.flush().await?;
-                    if let (Some(data), Some(c)) = (out.remote, client.as_mut())
+                    if out.bells > 0 && monitor.is_some()
+                        && let Some(at) = bell.on_bell(std::time::Instant::now(), now_ms()) {
+                            send_bell(&mut monitor, at).await;
+                        }
+                    if let (Some(data), Some(c)) = (out.remote, viewer.as_mut())
                         && c.state == ClientState::Viewing && !data.is_empty() {
                             let msg = FromSession::Output {
                                 data: protocol::encode_terminal_bytes(&data),
                             };
                             if c.send(&msg).await.is_err() {
-                                drop_client(&mut client, &mut mirror, &pty_write, &mut stdout)
+                                drop_viewer(&mut viewer, &mut mirror, &pty_write, &mut stdout)
                                     .await?;
                             }
                         }
                 }
             },
+
+            // A bell held by the debounce window is due to be reported.
+            _ = async {
+                tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(bell.deadline().unwrap()),
+                )
+                .await
+            }, if bell.deadline().is_some() => {
+                if let Some(at) = bell.fire(std::time::Instant::now()) {
+                    send_bell(&mut monitor, at).await;
+                }
+            }
 
             // Host terminal resized.
             _ = winch.recv() => {
@@ -146,65 +179,129 @@ async fn run(
                 apply_transition(&t, &pty_write, &mut stdout).await?;
             }
 
-            // A client connected to the session socket.
+            // A new connection: greet it and wait for its first message.
             conn = control.accept() => {
                 let stream = conn.context("session socket accept failed")?;
                 let mut new_client = Client::new(stream);
-                let connect = FromSession::Connect {
-                    version: PROTOCOL_VERSION,
-                    pid: std::process::id(),
-                    command: command_line.clone(),
-                    cwd: std::env::current_dir()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    host_width: host_size().1,
-                    host_height: host_size().0,
-                };
-                if client.is_some() {
+                if pending.is_some() {
                     let _ = new_client
                         .send(&FromSession::Error {
-                            message: "another client is already connected".into(),
+                            message: "another connection is being set up; retry".into(),
                         })
                         .await;
                     // new_client dropped, connection closes.
-                } else if new_client.send(&connect).await.is_ok() {
-                    client = Some(new_client);
+                } else {
+                    let connect = FromSession::Connect {
+                        version: PROTOCOL_VERSION,
+                        pid: std::process::id(),
+                        command: command_line.clone(),
+                        cwd: std::env::current_dir()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        host_width: host_size().1,
+                        host_height: host_size().0,
+                    };
+                    if new_client.send(&connect).await.is_ok() {
+                        pending = Some(new_client);
+                    }
                 }
             }
 
-            // A message from the connected client.
-            msg = async { client.as_mut().unwrap().next_message().await },
-                    if client.is_some() => {
+            // A pending connection's first message classifies it.
+            msg = async { pending.as_mut().unwrap().next_message().await },
+                    if pending.is_some() => {
+                let mut p = pending.take().unwrap();
+                match msg {
+                    Ok(Some(ToSession::Init { version, device, width, height })) => {
+                        let reject = if version != PROTOCOL_VERSION {
+                            Some(format!(
+                                "unsupported protocol version {version} \
+                                 (expected {PROTOCOL_VERSION})"
+                            ))
+                        } else if width == 0 || height == 0 {
+                            Some("invalid device dimensions".into())
+                        } else if viewer.is_some() {
+                            Some("another client is already connected".into())
+                        } else {
+                            None
+                        };
+                        match reject {
+                            Some(message) => {
+                                let _ = p.send(&FromSession::Error { message }).await;
+                            }
+                            None => {
+                                p.device = device;
+                                p.width = width;
+                                p.height = height;
+                                p.state = ClientState::Ready;
+                                viewer = Some(p);
+                            }
+                        }
+                    }
+                    Ok(Some(ToSession::Monitor { version })) => {
+                        if version == PROTOCOL_VERSION {
+                            // Replaces a previous monitor (e.g. after a
+                            // server restart whose old connection hasn't
+                            // been noticed as dead yet).
+                            monitor = Some(p);
+                        } else {
+                            let _ = p.send(&FromSession::Error {
+                                message: format!("unsupported protocol version {version}"),
+                            }).await;
+                        }
+                    }
+                    Ok(Some(_)) => {
+                        let _ = p.send(&FromSession::Error {
+                            message: "first message must be init or monitor".into(),
+                        }).await;
+                    }
+                    // EOF or garbage: connection dropped.
+                    Ok(None) | Err(_) => {}
+                }
+            }
+
+            // A message from the viewer.
+            msg = async { viewer.as_mut().unwrap().next_message().await },
+                    if viewer.is_some() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        let c = client.as_mut().unwrap();
+                        let c = viewer.as_mut().unwrap();
                         if let Err(e) =
-                            handle_client_message(msg, c, &mut mirror, &pty_write, &mut stdout)
+                            handle_viewer_message(msg, c, &mut mirror, &pty_write, &mut stdout)
                                 .await
                         {
                             let _ = c.send(&FromSession::Error {
                                 message: format!("{e:#}"),
                             }).await;
-                            drop_client(&mut client, &mut mirror, &pty_write, &mut stdout).await?;
+                            drop_viewer(&mut viewer, &mut mirror, &pty_write, &mut stdout).await?;
                         }
                     }
-                    // EOF or protocol garbage: drop the client.
+                    // EOF or protocol garbage: drop the viewer.
                     Ok(None) | Err(_) => {
-                        drop_client(&mut client, &mut mirror, &pty_write, &mut stdout).await?;
+                        drop_viewer(&mut viewer, &mut mirror, &pty_write, &mut stdout).await?;
                     }
+                }
+            }
+
+            // Monitors don't speak after their first message; poll only to
+            // notice hangups (ignoring anything else).
+            msg = async { monitor.as_mut().unwrap().next_message().await },
+                    if monitor.is_some() => {
+                if !matches!(msg, Ok(Some(_))) {
+                    monitor = None;
                 }
             }
 
             // Child exited: drain any final output, then finish.
             status = child.wait() => {
-                drain_pty(&mut pty_read, &mut mirror, &mut stdout, &mut client, &mut pty_buf)
+                drain_pty(&mut pty_read, &mut mirror, &mut stdout, &mut viewer, &mut pty_buf)
                     .await?;
                 break status?;
             }
         }
     };
 
-    if let Some(mut c) = client.take() {
+    if let Some(mut c) = viewer.take() {
         let _ = c
             .send(&FromSession::Exit {
                 status: status.code(),
@@ -217,9 +314,18 @@ async fn run(
     Ok(status)
 }
 
-/// Handle one message from the session client. An error return drops the
-/// client.
-async fn handle_client_message(
+/// Report a bell to the monitor connection, dropping it if the send fails.
+async fn send_bell(monitor: &mut Option<Client>, at: u64) {
+    if let Some(m) = monitor.as_mut()
+        && m.send(&FromSession::Bell { at }).await.is_err()
+    {
+        *monitor = None;
+    }
+}
+
+/// Handle one message from the viewer (already past init). An error return
+/// drops the viewer.
+async fn handle_viewer_message(
     msg: ToSession,
     client: &mut Client,
     mirror: &mut Mirror,
@@ -227,20 +333,8 @@ async fn handle_client_message(
     stdout: &mut tokio::io::Stdout,
 ) -> anyhow::Result<()> {
     match (msg, client.state) {
-        (ToSession::Init { version, device, width, height }, ClientState::AwaitingInit) => {
-            anyhow::ensure!(
-                version == PROTOCOL_VERSION,
-                "unsupported protocol version {version} (expected {PROTOCOL_VERSION})"
-            );
-            anyhow::ensure!(width > 0 && height > 0, "invalid device dimensions");
-            client.device = device;
-            client.width = width;
-            client.height = height;
-            client.state = ClientState::Ready;
-            Ok(())
-        }
         (ToSession::Init { .. }, _) => anyhow::bail!("duplicate init"),
-        (_, ClientState::AwaitingInit) => anyhow::bail!("first message must be init"),
+        (ToSession::Monitor { .. }, _) => anyhow::bail!("already initialized as a viewer"),
         (ToSession::View, _) => {
             // Replaces any active view, including the simulated one and a
             // re-sent view from the same client (which just re-snapshots).
@@ -263,7 +357,7 @@ async fn handle_client_message(
             client.state = ClientState::Ready;
             Ok(())
         }
-        (ToSession::Unview, ClientState::Ready) => Ok(()), // idempotent
+        (ToSession::Unview, _) => Ok(()), // idempotent
     }
 }
 
@@ -286,8 +380,8 @@ async fn toggle_simulated(
     apply_transition(&t, pty_write, stdout).await
 }
 
-/// Disconnect the session client, ending its view if it had one.
-async fn drop_client(
+/// Disconnect the viewer, ending its view if it had one.
+async fn drop_viewer(
     client: &mut Option<Client>,
     mirror: &mut Mirror,
     pty_write: &pty_process::OwnedWritePty,

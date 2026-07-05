@@ -76,6 +76,22 @@ async fn server_auth_list_connect_and_relay() {
         .next()
         .expect("no listen address in server output");
 
+    // The server monitor-connects to every live session socket at startup,
+    // identifying itself with a monitor message. Keep this connection: bells
+    // written to it must reach devices.
+    let (monitor_stream, _) = tokio::time::timeout(Duration::from_secs(5), fake_wrapper.accept())
+        .await
+        .expect("server never opened a monitor connection")
+        .unwrap();
+    let (monitor_read, mut monitor_write) = monitor_stream.into_split();
+    let mut monitor_reader = BufReader::new(monitor_read);
+    let mut line = String::new();
+    monitor_reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap(),
+        json!({"type": "monitor", "version": 1})
+    );
+
     // Bad token is rejected.
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
         .await
@@ -112,6 +128,21 @@ async fn server_auth_list_connect_and_relay() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["socket"], socket_name.as_str());
     assert_eq!(sessions[0]["cwd_hint"], "fake_cwd");
+    assert_eq!(sessions[0]["last_bell_at"], Value::Null);
+
+    // A bell reported on the monitor connection is pushed to the device and
+    // recorded for subsequent lists.
+    monitor_write
+        .write_all(b"{\"type\":\"bell\",\"at\":1234567890123}\n")
+        .await
+        .unwrap();
+    let reply = recv(&mut ws).await;
+    assert_eq!(reply["type"], "bell");
+    assert_eq!(reply["socket"], socket_name.as_str());
+    assert_eq!(reply["last_bell_at"], 1234567890123u64);
+    send(&mut ws, json!({"type": "list"})).await;
+    let reply = recv(&mut ws).await;
+    assert_eq!(reply["sessions"][0]["last_bell_at"], 1234567890123u64);
 
     // Connect: the server dials the session socket and sends an init derived
     // from the device's init.

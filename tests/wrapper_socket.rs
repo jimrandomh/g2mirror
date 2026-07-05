@@ -140,3 +140,92 @@ fn base64_decode(s: &str) -> Vec<u8> {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
 }
+
+#[tokio::test]
+async fn monitor_gets_debounced_bells_and_does_not_block_viewers() {
+    let dir = test_dir("bell");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args([
+            "sh",
+            "-c",
+            // Two bells 200ms apart: the first reports immediately, the
+            // second is held by the 3s debounce window.
+            "sleep 0.4; printf '\\a'; sleep 0.2; printf '\\a'; sleep 3",
+        ])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let wrapper_pid = wrapper.id().unwrap();
+
+    let socket_path = {
+        let mut found = None;
+        for _ in 0..100 {
+            if let Some(entry) = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .find(|e| e.file_name().to_string_lossy().starts_with(&format!("{wrapper_pid}-")))
+            {
+                found = Some(entry.path());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        found.expect("session socket never appeared")
+    };
+
+    // Connect as the monitor.
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut monitor = BufReader::new(read_half);
+    assert_eq!(read_msg(&mut monitor).await["type"], "connect");
+    write_half
+        .write_all(b"{\"type\":\"monitor\",\"version\":1}\n")
+        .await
+        .unwrap();
+
+    // The first bell arrives promptly with a plausible timestamp.
+    let before = now_ms();
+    let bell = read_msg(&mut monitor).await;
+    assert_eq!(bell["type"], "bell");
+    let at = bell["at"].as_u64().unwrap();
+    assert!(at >= before && at <= now_ms() + 1000, "bell at {at} out of range");
+
+    // The second bell (inside the window) is debounced: nothing for ~1s.
+    let mut line = String::new();
+    let quiet = tokio::time::timeout(Duration::from_secs(1), monitor.read_line(&mut line)).await;
+    assert!(quiet.is_err(), "second bell was not debounced: {line}");
+
+    // The monitor does not occupy the viewer slot: a device can still
+    // init and view.
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (viewer_read, mut viewer_write) = stream.into_split();
+    let mut viewer = BufReader::new(viewer_read);
+    assert_eq!(read_msg(&mut viewer).await["type"], "connect");
+    viewer_write
+        .write_all(
+            b"{\"type\":\"init\",\"version\":1,\"device\":\"t\",\"width\":96,\"height\":24}\n\
+              {\"type\":\"view\"}\n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_msg(&mut viewer).await["type"], "snapshot");
+
+    // The held bell is reported when the debounce window expires.
+    let trailing = read_msg(&mut monitor).await;
+    assert_eq!(trailing["type"], "bell");
+    assert!(trailing["at"].as_u64().unwrap() >= at);
+
+    wrapper.kill().await.ok();
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}

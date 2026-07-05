@@ -80,12 +80,17 @@ Failure reply (`error`), then the server closes the connection:
 ```json
 {"type": "sessions", "sessions": [
   {"socket": "84210-_Users_jim_repos_myproj", "pid": 84210,
-   "cwd_hint": "_Users_jim_repos_myproj"}
+   "cwd_hint": "_Users_jim_repos_myproj", "last_bell_at": 1782264921042}
 ]}
 ```
 
 `socket` is an opaque handle to pass to `connect`. `cwd_hint` is the
 sanitized working directory — display it to help the user pick a session.
+`last_bell_at` is when that terminal's bell last rang (unix epoch ms), or
+`null` if it hasn't rung since the server began monitoring the terminal
+(the server tracks bells for every terminal from the moment it discovers
+its socket, whether or not any device is attached; it does not know about
+bells that rang before then or while the server was down).
 
 **`{"type": "connect", "socket": "84210-_Users_jim_repos_myproj"}`** —
 attach to a session. The server dials the session socket and sends it a
@@ -97,6 +102,22 @@ next message you receive is the session's `connect` (below).
 `{"type": "disconnected", "reason": "requested"}`. You also receive a
 `disconnected` message if the session ends or errors out
 (`"reason": "session closed"`).
+
+### Unsolicited bell notifications
+
+Whenever any monitored terminal rings its bell — attached or not, viewed or
+not — every authenticated device receives:
+
+```json
+{"type": "bell", "socket": "84210-_Users_jim_repos_myproj",
+ "last_bell_at": 1782264921042}
+```
+
+Notifications for one terminal arrive at most every 3 seconds: the first
+bell is reported immediately, and bells rung inside the window are coalesced
+into one message when the window expires, so `last_bell_at` catches up to
+the latest bell. Use this to surface "an agent wants attention" cues on the
+glasses; ring the bell in the wrapped program (`printf '\a'`) to trigger it.
 
 ### Relay
 
@@ -111,6 +132,15 @@ Sending a non-server-scoped message while not attached yields an `error`.
 ## Session protocol (wrapper ↔ its client)
 
 Once attached, these are the messages you exchange (through the relay).
+
+A connection's first message determines its role: `init` makes it the
+**viewer** (at most one at a time), while `{"type": "monitor", "version": 1}`
+makes it a **monitor** — a role used by g2mirror-server to receive
+`{"type": "bell", "at": <unix ms>}` notifications (debounced to one per 3s,
+trailing bell reported when the window expires). A monitor does not count as
+a viewer: it cannot send `view`/`unview` and does not block a device from
+attaching. Drivers talk through the server and never need the monitor role
+themselves; it is documented here for completeness.
 
 ### From the session
 
@@ -188,8 +218,9 @@ for the person at the keyboard.
   works too).
 - Keyboard input from the device is **not supported** in protocol version 1
   — there is no message for it, and input modes are informational only.
-- One client per session: a second connection to a busy session socket gets
-  `error` and is closed.
+- One viewer per session: an `init` while another viewer is connected gets
+  `error` and the connection is closed. (The server's monitor connection is
+  separate and always present.)
 
 ## Liveness and cleanup
 

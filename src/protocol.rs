@@ -28,6 +28,10 @@ pub enum ToSession {
         width: u16,
         height: u16,
     },
+    /// Alternative first message: this connection is a monitor (normally
+    /// g2mirror-server). It receives bell notifications and does not count
+    /// as a viewer — it cannot send view/unview and does not block one.
+    Monitor { version: u32 },
     /// Start viewing: the wrapped app is resized to the device dimensions
     /// (SIGWINCH), a snapshot is sent immediately, then output streams.
     View,
@@ -55,6 +59,11 @@ pub enum FromSession {
     Snapshot { data: String },
     /// Incremental terminal output while viewing; base64, same encoding.
     Output { data: String },
+    /// Sent to monitor connections when the app rings the terminal bell.
+    /// `at` is unix epoch milliseconds; debounced to at most one message
+    /// per 3 seconds (a bell suppressed by the debounce window is reported
+    /// when the window expires, so the latest timestamp is not lost).
+    Bell { at: u64 },
     /// The wrapped app exited. The connection closes after this.
     Exit { status: Option<i32> },
     Error { message: String },
@@ -83,6 +92,9 @@ pub enum ServerToDevice {
     /// The session connection ended (wrapper exited, `disconnect` requested,
     /// or an I/O error occurred).
     Disconnected { reason: String },
+    /// A terminal rang its bell (sent to every connected device, whether or
+    /// not it is viewing that terminal). `last_bell_at` is unix epoch ms.
+    Bell { socket: String, last_bell_at: u64 },
     Error { message: String },
 }
 
@@ -93,6 +105,9 @@ pub struct SessionInfo {
     pub pid: u32,
     /// Sanitized working directory from the socket name.
     pub cwd_hint: String,
+    /// When this terminal's bell last rang (unix epoch ms), if it has rung
+    /// since the server started monitoring the terminal.
+    pub last_bell_at: Option<u64>,
 }
 
 pub fn encode_terminal_bytes(bytes: &[u8]) -> String {
