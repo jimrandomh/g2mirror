@@ -39,22 +39,29 @@ pub struct View {
     pub simulated: bool,
 }
 
-/// Parser callbacks that count audible bells. Counting through the parser
-/// (rather than scanning for 0x07) avoids false positives from BEL used as
-/// an OSC string terminator (e.g. window-title sequences).
+/// Parser callbacks collecting out-of-band terminal events: audible bells
+/// and window-title changes (OSC 0/2, BEL- or ST-terminated). Going through
+/// the parser (rather than scanning bytes) avoids false positives — e.g. the
+/// BEL that terminates a title sequence is not a bell.
 #[derive(Default)]
-struct BellCounter {
+struct Events {
     bells: usize,
+    /// Last title set in this chunk, if any.
+    title: Option<String>,
 }
 
-impl vt100::Callbacks for BellCounter {
+impl vt100::Callbacks for Events {
     fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.bells += 1;
     }
+
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
 }
 
-fn new_parser(rows: u16, cols: u16) -> vt100::Parser<BellCounter> {
-    vt100::Parser::new_with_callbacks(rows, cols, 0, BellCounter::default())
+fn new_parser(rows: u16, cols: u16) -> vt100::Parser<Events> {
+    vt100::Parser::new_with_callbacks(rows, cols, 0, Events::default())
 }
 
 pub struct Mirror {
@@ -62,8 +69,11 @@ pub struct Mirror {
     host_cols: u16,
     /// Screen model of the child's output, always sized to the child's
     /// current dimensions (host size normally, view size while viewing).
-    parser: vt100::Parser<BellCounter>,
+    parser: vt100::Parser<Events>,
     view: Option<View>,
+    /// Current window title, as last set by the app (survives view
+    /// transitions, which rebuild the parser).
+    title: Option<String>,
 }
 
 /// Result of processing a chunk of child output.
@@ -74,6 +84,8 @@ pub struct Output {
     pub remote: Option<Vec<u8>>,
     /// Number of audible bells in this chunk.
     pub bells: usize,
+    /// New window title, if it changed in this chunk.
+    pub title: Option<String>,
 }
 
 /// What the event loop should do after a state change.
@@ -93,11 +105,17 @@ impl Mirror {
             host_cols,
             parser: new_parser(host_rows, host_cols),
             view: None,
+            title: None,
         }
     }
 
     pub fn view(&self) -> Option<View> {
         self.view
+    }
+
+    /// Current window title, as last set by the app.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     /// Translate a chunk of child output.
@@ -109,19 +127,30 @@ impl Mirror {
                     host: bytes.to_vec(),
                     remote: None,
                     bells: self.take_bells(),
+                    // Pass-through already delivered the title sequence to
+                    // the host; this is for the session socket only.
+                    title: self.take_title_change(),
                 }
             }
             Some(_) => {
                 let prev = self.parser.screen().clone();
                 self.parser.process(bytes);
                 let bells = self.take_bells();
+                let title = self.take_title_change();
                 let screen = self.parser.screen();
+                let mut host = render_rows(screen, &prev, self.host_rows, self.host_cols, false);
+                // The render paths only reproduce screen contents, so a
+                // title change must be re-emitted to the host explicitly.
+                if let Some(t) = &title {
+                    host.extend_from_slice(format!("\x1b]2;{t}\x07").as_bytes());
+                }
                 Output {
-                    host: render_rows(screen, &prev, self.host_rows, self.host_cols, false),
+                    host,
                     // The device terminal is exactly view-sized, so the
                     // same-size diff stream is correct for it.
                     remote: Some(screen.state_diff(&prev)),
                     bells,
+                    title,
                 }
             }
         }
@@ -129,6 +158,17 @@ impl Mirror {
 
     fn take_bells(&mut self) -> usize {
         std::mem::take(&mut self.parser.callbacks_mut().bells)
+    }
+
+    /// The title set in the last processed chunk, if it differs from the
+    /// current one.
+    fn take_title_change(&mut self) -> Option<String> {
+        let title = self.parser.callbacks_mut().title.take()?;
+        if self.title.as_deref() == Some(title.as_str()) {
+            return None;
+        }
+        self.title = Some(title.clone());
+        Some(title)
     }
 
     /// A device started viewing: resize the child to the device dimensions
@@ -504,6 +544,51 @@ mod tests {
         let mut host = term(24, 80);
         start_view(&mut mirror, &mut host);
         assert_eq!(mirror.process(b"viewing\x07").bells, 1);
+    }
+
+    #[test]
+    fn title_changes_are_reported_once_per_change() {
+        let mut mirror = Mirror::new(24, 80);
+        assert_eq!(mirror.process(b"no title yet").title, None);
+        assert_eq!(mirror.title(), None);
+
+        // OSC 2, BEL-terminated.
+        let out = mirror.process(b"\x1b]2;first title\x07");
+        assert_eq!(out.title.as_deref(), Some("first title"));
+        assert_eq!(mirror.title(), Some("first title"));
+
+        // Setting the same title again is not a change.
+        assert_eq!(mirror.process(b"\x1b]2;first title\x07").title, None);
+
+        // OSC 0 (icon + title), ST-terminated.
+        let out = mirror.process(b"\x1b]0;second title\x1b\\");
+        assert_eq!(out.title.as_deref(), Some("second title"));
+
+        // OSC 1 sets only the icon name, not the title.
+        assert_eq!(mirror.process(b"\x1b]1;icon only\x07").title, None);
+        assert_eq!(mirror.title(), Some("second title"));
+    }
+
+    #[test]
+    fn title_survives_view_transitions_and_reaches_host_while_viewing() {
+        let mut mirror = Mirror::new(24, 80);
+        mirror.process(b"\x1b]2;steady title\x07");
+
+        let mut host = term(24, 80);
+        start_view(&mut mirror, &mut host);
+        assert_eq!(mirror.title(), Some("steady title"));
+
+        // While viewing, render paths don't carry OSC sequences, so a title
+        // change must be re-emitted to the host explicitly.
+        let out = mirror.process(b"\x1b]2;during view\x07");
+        assert_eq!(out.title.as_deref(), Some("during view"));
+        assert!(
+            String::from_utf8_lossy(&out.host).contains("\x1b]2;during view\x07"),
+            "host output must include the title sequence"
+        );
+
+        mirror.end_view();
+        assert_eq!(mirror.title(), Some("during view"));
     }
 
     #[test]

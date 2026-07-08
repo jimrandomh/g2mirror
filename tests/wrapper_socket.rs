@@ -148,9 +148,11 @@ async fn monitor_gets_debounced_bells_and_does_not_block_viewers() {
         .args([
             "sh",
             "-c",
-            // Two bells 200ms apart: the first reports immediately, the
-            // second is held by the 3s debounce window.
-            "sleep 0.4; printf '\\a'; sleep 0.2; printf '\\a'; sleep 3",
+            // A window title, then two bells 200ms apart: the first bell
+            // reports immediately, the second is held by the 3s debounce
+            // window.
+            "printf '\\033]2;agent busy\\007'; sleep 0.4; \
+             printf '\\a'; sleep 0.2; printf '\\a'; sleep 3",
         ])
         .env("G2MIRROR_DIR", &dir)
         .current_dir("/")
@@ -188,6 +190,11 @@ async fn monitor_gets_debounced_bells_and_does_not_block_viewers() {
         .await
         .unwrap();
 
+    // A monitor attaching after the app set its title learns it right away.
+    let title = read_msg(&mut monitor).await;
+    assert_eq!(title["type"], "title");
+    assert_eq!(title["title"], "agent busy");
+
     // The first bell arrives promptly with a plausible timestamp.
     let before = now_ms();
     let bell = read_msg(&mut monitor).await;
@@ -213,6 +220,10 @@ async fn monitor_gets_debounced_bells_and_does_not_block_viewers() {
         )
         .await
         .unwrap();
+    // Viewers also learn the current title on attach, before the snapshot.
+    let title = read_msg(&mut viewer).await;
+    assert_eq!(title["type"], "title");
+    assert_eq!(title["title"], "agent busy");
     assert_eq!(read_msg(&mut viewer).await["type"], "snapshot");
 
     // The held bell is reported when the debounce window expires.

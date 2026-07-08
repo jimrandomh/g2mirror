@@ -64,6 +64,9 @@ pub enum FromSession {
     /// per 3 seconds (a bell suppressed by the debounce window is reported
     /// when the window expires, so the latest timestamp is not lost).
     Bell { at: u64 },
+    /// The app set the window title (xterm OSC 0/2). Sent to the monitor
+    /// and the viewer on change, and once on attach if a title is set.
+    Title { title: String },
     /// The wrapped app exited. The connection closes after this.
     Exit { status: Option<i32> },
     Error { message: String },
@@ -95,6 +98,9 @@ pub enum ServerToDevice {
     /// A terminal rang its bell (sent to every connected device, whether or
     /// not it is viewing that terminal). `last_bell_at` is unix epoch ms.
     Bell { socket: String, last_bell_at: u64 },
+    /// A terminal's window title changed (sent to every connected device,
+    /// whether or not it is viewing that terminal).
+    Title { socket: String, title: String },
     Error { message: String },
 }
 
@@ -108,6 +114,8 @@ pub struct SessionInfo {
     /// When this terminal's bell last rang (unix epoch ms), if it has rung
     /// since the server started monitoring the terminal.
     pub last_bell_at: Option<u64>,
+    /// The terminal's window title, if the app has set one.
+    pub title: Option<String>,
 }
 
 pub fn encode_terminal_bytes(bytes: &[u8]) -> String {

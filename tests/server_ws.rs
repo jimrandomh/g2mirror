@@ -129,20 +129,29 @@ async fn server_auth_list_connect_and_relay() {
     assert_eq!(sessions[0]["socket"], socket_name.as_str());
     assert_eq!(sessions[0]["cwd_hint"], "fake_cwd");
     assert_eq!(sessions[0]["last_bell_at"], Value::Null);
+    assert_eq!(sessions[0]["title"], Value::Null);
 
-    // A bell reported on the monitor connection is pushed to the device and
-    // recorded for subsequent lists.
+    // Bells and titles reported on the monitor connection are pushed to the
+    // device and recorded for subsequent lists.
     monitor_write
-        .write_all(b"{\"type\":\"bell\",\"at\":1234567890123}\n")
+        .write_all(
+            b"{\"type\":\"bell\",\"at\":1234567890123}\n\
+              {\"type\":\"title\",\"title\":\"long task \\u2014 running\"}\n",
+        )
         .await
         .unwrap();
     let reply = recv(&mut ws).await;
     assert_eq!(reply["type"], "bell");
     assert_eq!(reply["socket"], socket_name.as_str());
     assert_eq!(reply["last_bell_at"], 1234567890123u64);
+    let reply = recv(&mut ws).await;
+    assert_eq!(reply["type"], "title");
+    assert_eq!(reply["socket"], socket_name.as_str());
+    assert_eq!(reply["title"], "long task — running");
     send(&mut ws, json!({"type": "list"})).await;
     let reply = recv(&mut ws).await;
     assert_eq!(reply["sessions"][0]["last_bell_at"], 1234567890123u64);
+    assert_eq!(reply["sessions"][0]["title"], "long task — running");
 
     // Connect: the server dials the session socket and sends an init derived
     // from the device's init.

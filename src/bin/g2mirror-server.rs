@@ -23,17 +23,24 @@ use tokio_tungstenite::WebSocketStream;
 /// How often to scan ~/.g2mirror for new session sockets to monitor.
 const MONITOR_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Bell tracking, shared between the monitor tasks (one per session socket,
-/// connected regardless of whether any device is attached) and the device
-/// connections.
+/// Per-terminal state learned through the monitor connections.
+#[derive(Default, Clone)]
+struct TerminalState {
+    /// Last bell (unix ms), if one has rung since monitoring began.
+    last_bell_at: Option<u64>,
+    /// Window title, if the app has set one since monitoring began.
+    title: Option<String>,
+}
+
+/// Terminal tracking, shared between the monitor tasks (one per session
+/// socket, connected regardless of whether any device is attached) and the
+/// device connections.
 struct BellState {
-    /// Session socket name -> last bell (unix ms), if one has rung since
-    /// the server started monitoring that terminal.
-    terminals: std::sync::Mutex<HashMap<String, Option<u64>>>,
+    terminals: std::sync::Mutex<HashMap<String, TerminalState>>,
     /// Socket names that currently have a live monitor task.
     monitored: std::sync::Mutex<HashSet<String>>,
-    /// Bell events (socket name, unix ms) fanned out to device connections.
-    bell_tx: tokio::sync::broadcast::Sender<(String, u64)>,
+    /// Bell/title events fanned out to every device connection.
+    event_tx: tokio::sync::broadcast::Sender<ServerToDevice>,
 }
 
 impl BellState {
@@ -41,17 +48,17 @@ impl BellState {
         Arc::new(Self {
             terminals: std::sync::Mutex::new(HashMap::new()),
             monitored: std::sync::Mutex::new(HashSet::new()),
-            bell_tx: tokio::sync::broadcast::channel(256).0,
+            event_tx: tokio::sync::broadcast::channel(256).0,
         })
     }
 
-    fn last_bell_at(&self, socket: &str) -> Option<u64> {
+    fn terminal(&self, socket: &str) -> TerminalState {
         self.terminals
             .lock()
             .unwrap()
             .get(socket)
-            .copied()
-            .flatten()
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -173,7 +180,7 @@ async fn monitor_manager(dir: PathBuf, state: Arc<BellState>) {
             // Forget terminals whose socket is gone; remember new ones.
             terminals.retain(|name, _| live.contains(name));
             for name in &live {
-                terminals.entry(name.clone()).or_insert(None);
+                terminals.entry(name.clone()).or_default();
             }
         }
         for name in live {
@@ -206,18 +213,34 @@ async fn run_monitor(path: &Path, name: &str, state: &BellState) -> anyhow::Resu
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        // Ignore everything except bells (e.g. the connect greeting).
-        if msg.get("type").and_then(|t| t.as_str()) == Some("bell")
-            && let Some(at) = msg.get("at").and_then(serde_json::Value::as_u64)
-        {
-            state
-                .terminals
-                .lock()
-                .unwrap()
-                .insert(name.to_string(), Some(at));
-            // Errors just mean no device is connected right now.
-            let _ = state.bell_tx.send((name.to_string(), at));
-        }
+        // Ignore anything else (e.g. the connect greeting).
+        let event = match msg.get("type").and_then(|t| t.as_str()) {
+            Some("bell") => {
+                let Some(at) = msg.get("at").and_then(serde_json::Value::as_u64) else {
+                    continue;
+                };
+                let mut terminals = state.terminals.lock().unwrap();
+                terminals.entry(name.to_string()).or_default().last_bell_at = Some(at);
+                ServerToDevice::Bell {
+                    socket: name.to_string(),
+                    last_bell_at: at,
+                }
+            }
+            Some("title") => {
+                let Some(title) = msg.get("title").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let mut terminals = state.terminals.lock().unwrap();
+                terminals.entry(name.to_string()).or_default().title = Some(title.to_string());
+                ServerToDevice::Title {
+                    socket: name.to_string(),
+                    title: title.to_string(),
+                }
+            }
+            _ => continue,
+        };
+        // Errors just mean no device is connected right now.
+        let _ = state.event_tx.send(event);
     }
     Ok(())
 }
@@ -261,7 +284,7 @@ async fn handle_device(
     .await?;
 
     let mut session: Option<SessionConn> = None;
-    let mut bell_rx = state.bell_tx.subscribe();
+    let mut event_rx = state.event_tx.subscribe();
     loop {
         tokio::select! {
             msg = ws.next() => {
@@ -282,13 +305,11 @@ async fn handle_device(
                     }
                 }
             }
-            // A terminal rang its bell (viewed or not): notify the device.
-            ev = bell_rx.recv() => {
-                if let Ok((socket, at)) = ev {
-                    send(&mut ws, &ServerToDevice::Bell {
-                        socket,
-                        last_bell_at: at,
-                    }).await?;
+            // A terminal rang its bell or changed its title (viewed or
+            // not): notify the device.
+            ev = event_rx.recv() => {
+                if let Ok(event) = ev {
+                    send(&mut ws, &event).await?;
                 }
                 // Lagged receivers just miss old events; `list` resyncs.
             }
@@ -412,11 +433,15 @@ fn live_session_sockets(dir: &Path) -> Vec<String> {
 fn list_sessions(dir: &Path, state: &BellState) -> Vec<SessionInfo> {
     live_session_sockets(dir)
         .into_iter()
-        .map(|name| SessionInfo {
-            pid: paths::socket_pid(&name).unwrap_or(0),
-            cwd_hint: name.split_once('-').map(|(_, p)| p).unwrap_or("").to_string(),
-            last_bell_at: state.last_bell_at(&name),
-            socket: name,
+        .map(|name| {
+            let terminal = state.terminal(&name);
+            SessionInfo {
+                pid: paths::socket_pid(&name).unwrap_or(0),
+                cwd_hint: name.split_once('-').map(|(_, p)| p).unwrap_or("").to_string(),
+                last_bell_at: terminal.last_bell_at,
+                title: terminal.title,
+                socket: name,
+            }
         })
         .collect()
 }

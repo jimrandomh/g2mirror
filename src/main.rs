@@ -157,6 +157,14 @@ async fn run(
                                     .await?;
                             }
                         }
+                    if let Some(title) = out.title {
+                        send_title(&mut monitor, &title).await;
+                        if let Some(c) = viewer.as_mut()
+                            && c.send(&FromSession::Title { title }).await.is_err() {
+                                drop_viewer(&mut viewer, &mut mirror, &pty_write, &mut stdout)
+                                    .await?;
+                            }
+                    }
                 }
             },
 
@@ -235,6 +243,9 @@ async fn run(
                                 p.height = height;
                                 p.state = ClientState::Ready;
                                 viewer = Some(p);
+                                if let Some(t) = mirror.title().map(str::to_string) {
+                                    send_title(&mut viewer, &t).await;
+                                }
                             }
                         }
                     }
@@ -244,6 +255,9 @@ async fn run(
                             // server restart whose old connection hasn't
                             // been noticed as dead yet).
                             monitor = Some(p);
+                            if let Some(t) = mirror.title().map(str::to_string) {
+                                send_title(&mut monitor, &t).await;
+                            }
                         } else {
                             let _ = p.send(&FromSession::Error {
                                 message: format!("unsupported protocol version {version}"),
@@ -320,6 +334,21 @@ async fn send_bell(monitor: &mut Option<Client>, at: u64) {
         && m.send(&FromSession::Bell { at }).await.is_err()
     {
         *monitor = None;
+    }
+}
+
+/// Report a title to a connection, dropping it if the send fails. (Safe for
+/// connections without an active view; the viewer's mid-view send failures
+/// are handled by `drop_viewer` at the call sites that need it.)
+async fn send_title(conn: &mut Option<Client>, title: &str) {
+    if let Some(c) = conn.as_mut()
+        && c.send(&FromSession::Title {
+            title: title.to_string(),
+        })
+        .await
+        .is_err()
+    {
+        *conn = None;
     }
 }
 

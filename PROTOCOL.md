@@ -80,17 +80,21 @@ Failure reply (`error`), then the server closes the connection:
 ```json
 {"type": "sessions", "sessions": [
   {"socket": "84210-_Users_jim_repos_myproj", "pid": 84210,
-   "cwd_hint": "_Users_jim_repos_myproj", "last_bell_at": 1782264921042}
+   "cwd_hint": "_Users_jim_repos_myproj", "last_bell_at": 1782264921042,
+   "title": "vim notes.md"}
 ]}
 ```
 
 `socket` is an opaque handle to pass to `connect`. `cwd_hint` is the
 sanitized working directory — display it to help the user pick a session.
-`last_bell_at` is when that terminal's bell last rang (unix epoch ms), or
-`null` if it hasn't rung since the server began monitoring the terminal
-(the server tracks bells for every terminal from the moment it discovers
-its socket, whether or not any device is attached; it does not know about
-bells that rang before then or while the server was down).
+`last_bell_at` is when that terminal's bell last rang (unix epoch ms), and
+`title` is the window title the app last set (xterm OSC 0/2, e.g. what
+would appear in a terminal emulator's title bar — often the running command
+or an agent's status line). Either is `null` if the event hasn't happened
+since the server began monitoring the terminal (the server monitors every
+terminal from the moment it discovers its socket, whether or not any device
+is attached; it does not know about bells or titles from before then or
+while the server was down).
 
 **`{"type": "connect", "socket": "84210-_Users_jim_repos_myproj"}`** —
 attach to a session. The server dials the session socket and sends it a
@@ -103,7 +107,7 @@ next message you receive is the session's `connect` (below).
 `disconnected` message if the session ends or errors out
 (`"reason": "session closed"`).
 
-### Unsolicited bell notifications
+### Unsolicited bell and title notifications
 
 Whenever any monitored terminal rings its bell — attached or not, viewed or
 not — every authenticated device receives:
@@ -113,11 +117,24 @@ not — every authenticated device receives:
  "last_bell_at": 1782264921042}
 ```
 
-Notifications for one terminal arrive at most every 3 seconds: the first
-bell is reported immediately, and bells rung inside the window are coalesced
-into one message when the window expires, so `last_bell_at` catches up to
-the latest bell. Use this to surface "an agent wants attention" cues on the
-glasses; ring the bell in the wrapped program (`printf '\a'`) to trigger it.
+Bell notifications for one terminal arrive at most every 3 seconds: the
+first bell is reported immediately, and bells rung inside the window are
+coalesced into one message when the window expires, so `last_bell_at`
+catches up to the latest bell. Use this to surface "an agent wants
+attention" cues on the glasses; ring the bell in the wrapped program
+(`printf '\a'`) to trigger it.
+
+Likewise, whenever a terminal app sets its window title (xterm OSC 0 or
+OSC 2, BEL- or ST-terminated), every authenticated device receives:
+
+```json
+{"type": "title", "socket": "84210-_Users_jim_repos_myproj",
+ "title": "vim notes.md"}
+```
+
+Title notifications are sent on change only (repeated sets of the same
+title are suppressed) and are not debounced. An empty string is a valid
+title (apps use it to clear the title bar).
 
 ### Relay
 
@@ -182,6 +199,17 @@ then get `disconnected` from the server):
 ```
 
 `status` is the exit code, or `null` if the app died to a signal.
+
+**`title`** — the app set the window title:
+
+```json
+{"type": "title", "title": "vim notes.md"}
+```
+
+Sent to both the viewer and the monitor whenever the title changes, and
+once on attach if the app has already set one. While viewing, the wrapper
+also re-emits the title sequence on its host terminal, so the host title
+bar stays in sync too.
 
 **`error`** — protocol violation report; the wrapper closes the connection
 after sending it.
