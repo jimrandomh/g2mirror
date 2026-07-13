@@ -30,7 +30,9 @@ truncated.
   terminal bell (`printf '\a'`) when they want attention.
 
 See [PROTOCOL.md](PROTOCOL.md) for the full protocol (aimed at glasses-
-driver implementers). Keyboard input from the device is not yet supported.
+driver implementers). Devices can send input (e.g. voice-to-text) unless
+the wrapper was started with `--readonly` or the server config sets
+`"readonly": true`.
 
 ## Build & run
 

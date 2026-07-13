@@ -70,6 +70,10 @@ struct Config {
     port: u16,
     /// Lowercase hex SHA-256 of the auth token.
     auth_token_hash: String,
+    /// When true, reject all input from devices regardless of what the
+    /// individual sessions allow.
+    #[serde(default)]
+    readonly: bool,
 }
 
 fn main() {
@@ -106,6 +110,7 @@ fn init_config() -> anyhow::Result<()> {
         listen_addr: "127.0.0.1".into(),
         port: 8737,
         auth_token_hash: hex(&sha2::Sha256::digest(token.as_bytes())),
+        readonly: false,
     };
     std::fs::write(&path, serde_json::to_string_pretty(&config)? + "\n")?;
     println!("wrote {}", path.display());
@@ -281,6 +286,7 @@ async fn handle_device(
         &mut ws,
         &ServerToDevice::Init {
             version: PROTOCOL_VERSION,
+            readonly: config.readonly,
         },
     )
     .await?;
@@ -292,7 +298,9 @@ async fn handle_device(
             msg = ws.next() => {
                 let Some(msg) = msg else { break };
                 let Message::Text(text) = msg? else { continue };
-                handle_device_message(&text, &mut ws, &mut session, &init, dir, state).await?;
+                handle_device_message(
+                    &text, &mut ws, &mut session, &init, dir, state, config.readonly,
+                ).await?;
             }
             line = async { session.as_mut().unwrap().next_line().await },
                     if session.is_some() => {
@@ -327,6 +335,7 @@ async fn handle_device_message(
     init: &DeviceInit,
     dir: &Path,
     state: &BellState,
+    readonly: bool,
 ) -> anyhow::Result<()> {
     let parsed: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -386,6 +395,18 @@ async fn handle_device_message(
                 ws,
                 &ServerToDevice::Disconnected {
                     reason: "requested".into(),
+                },
+            )
+            .await
+        }
+        // Input is normally forwarded like any other message, but a
+        // read-only server refuses it here (sessions can independently
+        // refuse via their own --readonly flag).
+        Some("input") if readonly => {
+            send(
+                ws,
+                &ServerToDevice::Error {
+                    message: "server is read-only".into(),
                 },
             )
             .await

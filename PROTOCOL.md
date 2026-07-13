@@ -64,8 +64,14 @@ The device's **first** message must be `init`:
 Success reply:
 
 ```json
-{"type": "init", "version": 1}
+{"type": "init", "version": 1, "readonly": false}
 ```
+
+`readonly` reflects the server's configuration: when true, the server
+rejects every `input` message itself. A session can additionally be
+read-only via its wrapper's `--readonly` flag, reported in its `connect`
+message — input works only when neither is set, so a driver should offer
+input only when both flags are false.
 
 Failure reply (`error`), then the server closes the connection:
 
@@ -166,11 +172,13 @@ themselves; it is documented here for completeness.
 
 ```json
 {"type": "connect", "version": 1, "pid": 84210, "command": "vim notes.md",
- "cwd": "/Users/jim/repos/myproj", "host_width": 143, "host_height": 40}
+ "cwd": "/Users/jim/repos/myproj", "host_width": 143, "host_height": 40,
+ "readonly": false}
 ```
 
 `host_width`/`host_height` are the size of the terminal the wrapper is
-running in (cells), for display purposes.
+running in (cells), for display purposes. `readonly` is true when the
+wrapper was started with `--readonly` and will reject `input`.
 
 **`snapshot`** — the immediate answer to `view`:
 
@@ -235,6 +243,29 @@ is resized back to the host terminal. Idempotent. Use this whenever the
 glasses UI navigates away from the terminal so the app returns to full size
 for the person at the keyboard.
 
+**`{"type": "input", "data": "<base64>"}`** — write bytes to the app's
+terminal, exactly as a terminal emulator would send them for keystrokes.
+For plain text (e.g. voice-to-text) this is just the UTF-8 text, typically
+followed by `\r` (0x0D — what the Enter key sends) to submit it. Accepted
+whether or not you are currently viewing. If the session or the server is
+read-only, the rejecting side replies with an `error` message but keeps the
+connection open.
+
+### Input modes and special keys
+
+Sequences that change how a terminal is expected to encode keys — DECCKM
+application cursor keys (`CSI ? 1 h/l`), application keypad (`ESC =`/
+`ESC >`), bracketed paste (`CSI ? 2004 h/l`), and the xterm mouse modes —
+are mirrored unmodified into the snapshot/output byte stream, so the
+driver's emulator always knows the current modes. When you eventually send
+special keys, encode them according to that state (e.g. Up arrow is
+`ESC [ A` normally but `ESC O A` in application-cursor mode), and when
+bracketed paste is enabled, wrap inserted text in `ESC [ 200 ~` … `ESC [
+201 ~` so apps like editors treat voice input as a paste rather than typed
+keystrokes. Protocol version 1 does not model the kitty keyboard protocol
+(`CSI > 1 u` etc.): those negotiation sequences are not mirrored, so encode
+keys per the classic xterm rules above.
+
 ## Terminal data notes
 
 - The byte streams use standard VT100/xterm escape sequences (CSI cursor
@@ -245,8 +276,8 @@ for the person at the keyboard.
 - Any headless terminal-emulator library that maintains a screen grid works
   (the reference implementation uses Rust's `vt100` crate; xterm.js headless
   works too).
-- Keyboard input from the device is **not supported** in protocol version 1
-  — there is no message for it, and input modes are informational only.
+- Device input is supported via the `input` message (see above), gated by
+  the two read-only flags.
 - One viewer per session: an `init` while another viewer is connected gets
   `error` and the connection is closed. (The server's monitor connection is
   separate and always present.)

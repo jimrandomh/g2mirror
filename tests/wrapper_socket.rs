@@ -297,6 +297,123 @@ async fn title_flag_sets_initial_title() {
     wrapper.kill().await.ok();
 }
 
+async fn find_socket(dir: &std::path::Path, pid: u32) -> PathBuf {
+    for _ in 0..100 {
+        if let Some(entry) = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with(&format!("{pid}-")))
+        {
+            return entry.path();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("session socket never appeared");
+}
+
+#[tokio::test]
+async fn input_reaches_the_wrapped_program() {
+    let dir = test_dir("input");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["cat"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket_path = find_socket(&dir, wrapper.id().unwrap()).await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut viewer = BufReader::new(read_half);
+    assert_eq!(read_msg(&mut viewer).await["type"], "connect");
+
+    let input = base64_encode(b"hello from glasses\r");
+    write_half
+        .write_all(
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"type":"init","version":1,"device":"t","width":96,"height":24}"#,
+                r#"{"type":"view"}"#,
+                format_args!(r#"{{"type":"input","data":"{input}"}}"#),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_msg(&mut viewer).await["type"], "snapshot");
+
+    // The pty echoes the typed line, so it comes back in the output stream.
+    let mut device = vt100::Parser::new(24, 96, 0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !device.screen().contents().contains("hello from glasses") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "input never echoed back; screen:\n{}",
+            device.screen().contents()
+        );
+        let msg = read_msg(&mut viewer).await;
+        if msg["type"] == "output" {
+            device.process(&base64_decode(msg["data"].as_str().unwrap()));
+        }
+    }
+
+    wrapper.kill().await.ok();
+}
+
+#[tokio::test]
+async fn readonly_wrapper_rejects_input_without_dropping_connection() {
+    let dir = test_dir("readonly");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["--readonly", "sh", "-c", "sleep 2"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket_path = find_socket(&dir, wrapper.id().unwrap()).await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut viewer = BufReader::new(read_half);
+    let connect = read_msg(&mut viewer).await;
+    assert_eq!(connect["type"], "connect");
+    assert_eq!(connect["readonly"], true);
+
+    let input = base64_encode(b"denied\r");
+    write_half
+        .write_all(
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"init","version":1,"device":"t","width":96,"height":24}"#,
+                format_args!(r#"{{"type":"input","data":"{input}"}}"#),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let reply = read_msg(&mut viewer).await;
+    assert_eq!(reply["type"], "error");
+    assert_eq!(reply["message"], "session is read-only");
+
+    // The connection survives the rejection: view still works.
+    write_half.write_all(b"{\"type\":\"view\"}\n").await.unwrap();
+    assert_eq!(read_msg(&mut viewer).await["type"], "snapshot");
+
+    wrapper.kill().await.ok();
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -38,6 +38,13 @@ pub enum ToSession {
     /// Stop viewing: the app is resized back to the host terminal and
     /// output streaming stops.
     Unview,
+    /// Keyboard/voice input for the wrapped app: base64 of the bytes to
+    /// write to its terminal, exactly as a terminal emulator would encode
+    /// them (the device driver is responsible for honoring the input modes
+    /// mirrored in the output stream, e.g. bracketed paste). Rejected with
+    /// an `error` message — without closing the connection — when the
+    /// session is read-only.
+    Input { data: String },
 }
 
 /// Session protocol: wrapper -> client.
@@ -52,6 +59,9 @@ pub enum FromSession {
         cwd: String,
         host_width: u16,
         host_height: u16,
+        /// True when the wrapper was started with --readonly; input
+        /// messages will be rejected.
+        readonly: bool,
     },
     /// Full repaint of the device screen; sent on view. `data` is base64 of
     /// terminal bytes (escape sequences) to feed a fresh emulator of the
@@ -88,8 +98,12 @@ pub struct DeviceInit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToDevice {
-    /// Reply to a successful init.
-    Init { version: u32 },
+    /// Reply to a successful init. `readonly` reflects the server's config:
+    /// when true the server rejects all input messages. (A session may
+    /// additionally be read-only via the wrapper's --readonly flag,
+    /// reported in its connect message; input works only when neither is
+    /// set.)
+    Init { version: u32, readonly: bool },
     /// Reply to `list`.
     Sessions { sessions: Vec<SessionInfo> },
     /// The session connection ended (wrapper exited, `disconnect` requested,

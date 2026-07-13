@@ -119,6 +119,7 @@ async fn server_auth_list_connect_and_relay() {
     let reply = recv(&mut ws).await;
     assert_eq!(reply["type"], "init");
     assert_eq!(reply["version"], 1);
+    assert_eq!(reply["readonly"], false);
 
     // List shows the fake session.
     send(&mut ws, json!({"type": "list"})).await;
@@ -181,17 +182,17 @@ async fn server_auth_list_connect_and_relay() {
     assert_eq!(reply["pid"], 42);
     assert_eq!(reply["command"], "vim");
 
-    // Device -> wrapper relay is verbatim for non-server message types.
-    send(&mut ws, json!({"type": "view"})).await;
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(5), wrapper_reader.read_line(&mut line))
-        .await
-        .expect("view was not relayed")
-        .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&line).unwrap(),
-        json!({"type": "view"})
-    );
+    // Device -> wrapper relay is verbatim for non-server message types,
+    // including input (the server is not read-only here).
+    for msg in [json!({"type": "view"}), json!({"type": "input", "data": "aGkNCg=="})] {
+        send(&mut ws, msg.clone()).await;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), wrapper_reader.read_line(&mut line))
+            .await
+            .expect("message was not relayed")
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), msg);
+    }
 
     // Wrapper hangup surfaces as a disconnected message.
     drop(write_half);
@@ -203,4 +204,55 @@ async fn server_auth_list_connect_and_relay() {
     send(&mut ws, json!({"type": "view"})).await;
     let reply = recv(&mut ws).await;
     assert_eq!(reply["type"], "error");
+}
+
+#[tokio::test]
+async fn readonly_server_rejects_input() {
+    let dir = test_dir("roserver");
+    let token = "ro-token";
+    let hash = sha2::Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    std::fs::write(
+        dir.join("config.json"),
+        json!({"listen_addr": "127.0.0.1", "port": 0,
+               "auth_token_hash": hash, "readonly": true})
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut server = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror-server"))
+        .env("G2MIRROR_DIR", &dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut server_out = BufReader::new(server.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), server_out.read_line(&mut line))
+        .await
+        .expect("server did not start")
+        .unwrap();
+    let addr = line.trim().rsplit(' ').next().unwrap();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+        .await
+        .unwrap();
+    send(
+        &mut ws,
+        json!({"type": "init", "version": 1, "auth_token": token,
+               "device": "T", "width": 96, "height": 24}),
+    )
+    .await;
+    let reply = recv(&mut ws).await;
+    assert_eq!(reply["type"], "init");
+    assert_eq!(reply["readonly"], true);
+
+    // Input is refused by the server itself, before any session forwarding.
+    send(&mut ws, json!({"type": "input", "data": "aGkNCg=="})).await;
+    let reply = recv(&mut ws).await;
+    assert_eq!(reply["type"], "error");
+    assert_eq!(reply["message"], "server is read-only");
 }

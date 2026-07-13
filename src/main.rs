@@ -36,8 +36,9 @@ fn now_ms() -> u64 {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: g2mirror [--title <title>] <command> [args...]");
-    eprintln!("  --title  initial window title, until the program sets one itself");
+    eprintln!("usage: g2mirror [--title <title>] [--readonly] <command> [args...]");
+    eprintln!("  --title     initial window title, until the program sets one itself");
+    eprintln!("  --readonly  reject input from connected devices");
     eprintln!("  Ctrl+G simulates glasses connect/disconnect");
     std::process::exit(2);
 }
@@ -45,6 +46,7 @@ fn usage() -> ! {
 fn main() {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut title: Option<String> = None;
+    let mut readonly = false;
     let program = loop {
         let Some(arg) = args.next() else { usage() };
         match arg.to_str() {
@@ -58,6 +60,7 @@ fn main() {
             Some(s) if s.starts_with("--title=") => {
                 title = Some(s["--title=".len()..].to_string());
             }
+            Some("--readonly") => readonly = true,
             Some("--") => match args.next() {
                 Some(program) => break program,
                 None => usage(),
@@ -75,7 +78,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    match runtime.block_on(run(program, args, title)) {
+    match runtime.block_on(run(program, args, title, readonly)) {
         Ok(status) => std::process::exit(exit_code(status)),
         Err(e) => {
             eprintln!("g2mirror: {e:#}");
@@ -100,6 +103,7 @@ async fn run(
     program: std::ffi::OsString,
     args: Vec<std::ffi::OsString>,
     title: Option<String>,
+    readonly: bool,
 ) -> anyhow::Result<ExitStatus> {
     let (host_rows, host_cols) = host_size();
 
@@ -259,6 +263,7 @@ async fn run(
                             .unwrap_or_default(),
                         host_width: host_size().1,
                         host_height: host_size().0,
+                        readonly,
                     };
                     if new_client.send(&connect).await.is_ok() {
                         pending = Some(new_client);
@@ -331,9 +336,10 @@ async fn run(
                 match msg {
                     Ok(Some(msg)) => {
                         let c = viewer.as_mut().unwrap();
-                        if let Err(e) =
-                            handle_viewer_message(msg, c, &mut mirror, &pty_write, &mut stdout)
-                                .await
+                        if let Err(e) = handle_viewer_message(
+                            msg, c, &mut mirror, &mut pty_write, &mut stdout, readonly,
+                        )
+                        .await
                         {
                             let _ = c.send(&FromSession::Error {
                                 message: format!("{e:#}"),
@@ -409,12 +415,29 @@ async fn handle_viewer_message(
     msg: ToSession,
     client: &mut Client,
     mirror: &mut Mirror,
-    pty_write: &pty_process::OwnedWritePty,
+    pty_write: &mut pty_process::OwnedWritePty,
     stdout: &mut tokio::io::Stdout,
+    readonly: bool,
 ) -> anyhow::Result<()> {
     match (msg, client.state) {
         (ToSession::Init { .. }, _) => anyhow::bail!("duplicate init"),
         (ToSession::Monitor { .. }, _) => anyhow::bail!("already initialized as a viewer"),
+        (ToSession::Input { data }, _) => {
+            if readonly {
+                // Reject without dropping the connection: a read-only
+                // session is a policy answer, not a protocol violation.
+                client
+                    .send(&FromSession::Error {
+                        message: "session is read-only".into(),
+                    })
+                    .await?;
+                return Ok(());
+            }
+            let bytes = protocol::decode_terminal_bytes(&data)
+                .map_err(|e| anyhow::anyhow!("invalid input encoding: {e}"))?;
+            pty_write.write_all(&bytes).await?;
+            Ok(())
+        }
         (ToSession::View, _) => {
             // Replaces any active view, including the simulated one and a
             // re-sent view from the same client (which just re-snapshots).
