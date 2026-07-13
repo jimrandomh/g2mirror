@@ -37,12 +37,17 @@ driver implementers). Keyboard input from the device is not yet supported.
 ```sh
 cargo build
 ./target/debug/g2mirror htop           # press Ctrl+G to toggle the simulated view
+./target/debug/g2mirror --title "build watcher" -- make watch
 
 ./target/debug/g2mirror-server --init-config   # once; prints the auth token
 ./target/debug/g2mirror-server                 # ws://127.0.0.1:8737
 ```
 
-The wrapped command's exit status is propagated. `cargo test` runs unit
+`--title` sets the initial window title (shown in session lists and pushed
+to devices) for programs that never set one themselves; a program-set title
+takes over from there. The wrapped command's exit status is propagated, and
+a client watching when the program quits receives an `exit` message carrying
+that status. `cargo test` runs unit
 tests plus end-to-end tests of the session socket, the websocket server,
 and the full device→server→wrapper chain.
 

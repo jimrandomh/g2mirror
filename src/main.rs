@@ -35,12 +35,39 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn usage() -> ! {
+    eprintln!("usage: g2mirror [--title <title>] <command> [args...]");
+    eprintln!("  --title  initial window title, until the program sets one itself");
+    eprintln!("  Ctrl+G simulates glasses connect/disconnect");
+    std::process::exit(2);
+}
+
 fn main() {
-    let mut args = std::env::args_os().skip(1);
-    let Some(program) = args.next() else {
-        eprintln!("usage: g2mirror <command> [args...]");
-        eprintln!("  Ctrl+G simulates glasses connect/disconnect");
-        std::process::exit(2);
+    let mut args = std::env::args_os().skip(1).peekable();
+    let mut title: Option<String> = None;
+    let program = loop {
+        let Some(arg) = args.next() else { usage() };
+        match arg.to_str() {
+            Some("--title") => match args.next() {
+                Some(value) => title = Some(value.to_string_lossy().into_owned()),
+                None => {
+                    eprintln!("g2mirror: --title requires a value");
+                    usage();
+                }
+            },
+            Some(s) if s.starts_with("--title=") => {
+                title = Some(s["--title=".len()..].to_string());
+            }
+            Some("--") => match args.next() {
+                Some(program) => break program,
+                None => usage(),
+            },
+            Some(s) if s.starts_with('-') && s.len() > 1 => {
+                eprintln!("g2mirror: unknown option {s}");
+                usage();
+            }
+            _ => break arg,
+        }
     };
     let args: Vec<_> = args.collect();
 
@@ -48,7 +75,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    match runtime.block_on(run(program, args)) {
+    match runtime.block_on(run(program, args, title)) {
         Ok(status) => std::process::exit(exit_code(status)),
         Err(e) => {
             eprintln!("g2mirror: {e:#}");
@@ -72,8 +99,22 @@ fn host_size() -> (u16, u16) {
 async fn run(
     program: std::ffi::OsString,
     args: Vec<std::ffi::OsString>,
+    title: Option<String>,
 ) -> anyhow::Result<ExitStatus> {
     let (host_rows, host_cols) = host_size();
+
+    // Point the user at server setup while the screen is still ours; a
+    // fullscreen child will repaint over it, but it shows before launch.
+    if let Ok(dir) = g2mirror::paths::g2mirror_dir() {
+        let config = g2mirror::paths::config_path(&dir);
+        if !config.exists() {
+            eprintln!(
+                "g2mirror: {} not found; to enable device connections, run \
+                 `g2mirror-server --init-config` and then `g2mirror-server`",
+                config.display()
+            );
+        }
+    }
 
     let control = ControlListener::bind()?;
 
@@ -104,6 +145,16 @@ async fn run(
     let mut winch = signal(SignalKind::window_change())?;
 
     let mut mirror = Mirror::new(host_rows, host_cols);
+    if let Some(t) = title {
+        // Show it on the host terminal too; strip control characters so an
+        // exotic title can't break out of the escape sequence.
+        let clean: String = t.chars().filter(|c| !c.is_control()).collect();
+        stdout
+            .write_all(format!("\x1b]2;{clean}\x07").as_bytes())
+            .await?;
+        stdout.flush().await?;
+        mirror.set_title(clean);
+    }
     // Connection slots: a freshly accepted connection is `pending` until its
     // first message classifies it as the viewer (a device, via init) or the
     // monitor (g2mirror-server, via monitor). One of each at a time; the

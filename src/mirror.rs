@@ -118,6 +118,12 @@ impl Mirror {
         self.title.as_deref()
     }
 
+    /// Seed the title (from the --title flag) before the app has set one.
+    /// An app-set title takes over from here via the usual change tracking.
+    pub fn set_title(&mut self, title: String) {
+        self.title = Some(title);
+    }
+
     /// Translate a chunk of child output.
     pub fn process(&mut self, bytes: &[u8]) -> Output {
         match self.view {

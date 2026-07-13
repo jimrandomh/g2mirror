@@ -234,6 +234,69 @@ async fn monitor_gets_debounced_bells_and_does_not_block_viewers() {
     wrapper.kill().await.ok();
 }
 
+#[tokio::test]
+async fn title_flag_sets_initial_title() {
+    let dir = test_dir("title");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["--title", "initial title", "sh", "-c", "sleep 2"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let wrapper_pid = wrapper.id().unwrap();
+
+    // The host terminal gets the title escape sequence at startup.
+    let mut host_stdout = wrapper.stdout.take().unwrap();
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while !String::from_utf8_lossy(&seen).contains("\x1b]2;initial title\x07") {
+        let n = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut host_stdout, &mut chunk),
+        )
+        .await
+        .expect("title sequence never reached the host stream")
+        .unwrap();
+        assert!(n > 0, "wrapper stdout closed early");
+        seen.extend_from_slice(&chunk[..n]);
+    }
+
+    // A monitor learns the initial title on attach, even though the wrapped
+    // program never set one.
+    let socket_path = {
+        let mut found = None;
+        for _ in 0..100 {
+            if let Some(entry) = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .find(|e| e.file_name().to_string_lossy().starts_with(&format!("{wrapper_pid}-")))
+            {
+                found = Some(entry.path());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        found.expect("session socket never appeared")
+    };
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut monitor = BufReader::new(read_half);
+    assert_eq!(read_msg(&mut monitor).await["type"], "connect");
+    write_half
+        .write_all(b"{\"type\":\"monitor\",\"version\":1}\n")
+        .await
+        .unwrap();
+    let title = read_msg(&mut monitor).await;
+    assert_eq!(title["type"], "title");
+    assert_eq!(title["title"], "initial title");
+
+    wrapper.kill().await.ok();
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -90,7 +90,8 @@ sanitized working directory — display it to help the user pick a session.
 `last_bell_at` is when that terminal's bell last rang (unix epoch ms), and
 `title` is the window title the app last set (xterm OSC 0/2, e.g. what
 would appear in a terminal emulator's title bar — often the running command
-or an agent's status line). Either is `null` if the event hasn't happened
+or an agent's status line); until the app sets one it is the wrapper's
+`--title` value, if that was given. Either is `null` if the event hasn't happened
 since the server began monitoring the terminal (the server monitors every
 terminal from the moment it discovers its socket, whether or not any device
 is attached; it does not know about bells or titles from before then or

@@ -111,6 +111,8 @@ fn init_config() -> anyhow::Result<()> {
     println!("wrote {}", path.display());
     println!("auth token (save it now; only the hash is stored):");
     println!("{token}");
+    println!();
+    println!("start the server by running: g2mirror-server");
     Ok(())
 }
 
