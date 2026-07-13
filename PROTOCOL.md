@@ -173,17 +173,18 @@ themselves; it is documented here for completeness.
 ```json
 {"type": "connect", "version": 1, "pid": 84210, "command": "vim notes.md",
  "cwd": "/Users/jim/repos/myproj", "host_width": 143, "host_height": 40,
- "readonly": false}
+ "readonly": false, "history": {"next": 1523, "oldest": 0}}
 ```
 
 `host_width`/`host_height` are the size of the terminal the wrapper is
 running in (cells), for display purposes. `readonly` is true when the
-wrapper was started with `--readonly` and will reject `input`.
+wrapper was started with `--readonly` and will reject `input`. `history`
+is the scrollback archive extent (see "Scrollback history" below).
 
 **`snapshot`** — the immediate answer to `view`:
 
 ```json
-{"type": "snapshot", "data": "<base64>"}
+{"type": "snapshot", "data": "<base64>", "history_next": 1523}
 ```
 
 `data` is base64 of raw terminal bytes (VT100/xterm escape sequences).
@@ -250,6 +251,56 @@ followed by `\r` (0x0D — what the Enter key sends) to submit it. Accepted
 whether or not you are currently viewing. If the session or the server is
 read-only, the rejecting side replies with an `error` message but keeps the
 connection open.
+
+### Scrollback history
+
+The wrapper archives every line that scrolls off the (primary) screen —
+including output from before any client connected — as an append-only
+sequence with stable line indices, retained up to a cap (10,000 lines by
+default; `--scrollback` changes it). Alternate-screen output (vim, htop)
+produces no history, matching xterm.
+
+**The client-side scrollback contract:** your emulator witnesses every line
+that scrolls off while you are viewing, so retain those locally and treat
+the archive as the source for what you *didn't* see. The `history_next`
+value in each `snapshot` is the splice point: lines with index <
+`history_next` are fetchable from the archive; lines your emulator sees
+scroll off after the snapshot continue from that index. On re-`view`, the
+new snapshot's `history_next` tells you how much appeared in between.
+
+Fetch lazily, paging backwards from the splice point:
+
+```json
+{"type": "history", "before": 1523, "limit": 200}
+```
+
+```json
+{"type": "history_lines", "start": 1323, "oldest": 0, "next": 1601,
+ "lines": [
+   {"data": "<base64>", "width": 143, "wrapped": false},
+   ...
+ ]}
+```
+
+- `lines` are indices `start..start+lines.len()` in oldest-to-newest order,
+  ending just before `before`. Page older with `before = start`. `limit`
+  defaults to 500 and replies are additionally capped at a byte budget
+  (~192KB of line data), so a reply may contain fewer lines than requested
+  even when older lines exist — always page by `start`, not by counting.
+- Requests older than `oldest` (evicted or never existed) return fewer or
+  zero lines; `start == oldest` with an empty remainder means you have
+  everything retained.
+- Each line's `data` decodes to **self-contained styled text**: printable
+  characters and SGR color/attribute sequences only, starting from default
+  attributes — no cursor movement, no mode changes. Render it on a fresh
+  row (or reset attributes first) of a terminal at least `width` columns
+  wide, or strip `ESC[...m` sequences for plain text.
+- `width` is the column count the line was laid out at (it varies across
+  the session as the wrapper's terminal resizes and views attach at their
+  own sizes). `wrapped: true` means the line soft-wraps: it and the next
+  record form one logical line, so you may concatenate wrapped runs and
+  re-wrap them at your own width; hard lines (`wrapped: false`) wider than
+  your screen are yours to crop or wrap as you prefer.
 
 ### Input modes and special keys
 

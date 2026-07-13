@@ -16,9 +16,21 @@
 //! - the viewing device, which is exactly model-sized, so it gets the
 //!   whole-screen `state_diff` byte stream.
 
+use crate::history::{History, HistoryRecord, DEFAULT_MAX_LINES, MAX_LINE_BYTES};
+
 /// Dimensions used for the hotkey-simulated device.
 pub const SIM_ROWS: u16 = 24;
 pub const SIM_COLS: u16 = 96;
+
+/// vt100's internal scrollback acts as a staging buffer for history capture:
+/// rows land there when the (primary) screen scrolls, and we drain new rows
+/// into the archive after every processed slice. vt100 offers no way to
+/// remove staged rows, so this bounds both the transient capture window and
+/// the dead weight a long session carries.
+const STAGE_SCROLLBACK: usize = 4096;
+/// Output is parsed in slices no larger than this so that a flood of
+/// one-byte lines can't overflow the staging buffer between drains.
+const PROCESS_SLICE: usize = 2048;
 
 const CLEAR: &[u8] = b"\x1b[0m\x1b[H\x1b[2J";
 const SGR_RESET: &[u8] = b"\x1b[0m";
@@ -61,7 +73,7 @@ impl vt100::Callbacks for Events {
 }
 
 fn new_parser(rows: u16, cols: u16) -> vt100::Parser<Events> {
-    vt100::Parser::new_with_callbacks(rows, cols, 0, Events::default())
+    vt100::Parser::new_with_callbacks(rows, cols, STAGE_SCROLLBACK, Events::default())
 }
 
 pub struct Mirror {
@@ -70,10 +82,24 @@ pub struct Mirror {
     /// Screen model of the child's output, always sized to the child's
     /// current dimensions (host size normally, view size while viewing).
     parser: vt100::Parser<Events>,
+    /// While viewing: a second parser fed the same bytes, holding the state
+    /// as of the last render, so diffs don't need to clone the main screen
+    /// (whose scrollback staging makes clones expensive).
+    shadow: Option<vt100::Parser>,
     view: Option<View>,
     /// Current window title, as last set by the app (survives view
     /// transitions, which rebuild the parser).
     title: Option<String>,
+    /// Archive of lines that scrolled off the (primary) screen.
+    history: History,
+    /// Scroll counter: while parked at offset 1, every row pushed to the
+    /// staging scrollback advances the offset by one, giving an exact count
+    /// of new rows even after the staging buffer is full. False while the
+    /// buffer is empty or a harvest is deferred by the alternate screen.
+    parked: bool,
+    /// Staging-buffer length after the last harvest, the fallback counter
+    /// when parking wasn't possible.
+    staged_seen: usize,
 }
 
 /// Result of processing a chunk of child output.
@@ -104,9 +130,26 @@ impl Mirror {
             host_rows,
             host_cols,
             parser: new_parser(host_rows, host_cols),
+            shadow: None,
             view: None,
             title: None,
+            history: History::new(DEFAULT_MAX_LINES),
+            parked: false,
+            staged_seen: 0,
         }
+    }
+
+    pub fn set_history_limit(&mut self, max_lines: usize) {
+        self.history.set_max_lines(max_lines);
+    }
+
+    /// (next, oldest) indices of the history archive.
+    pub fn history_extent(&self) -> (u64, u64) {
+        (self.history.next_index(), self.history.oldest())
+    }
+
+    pub fn history(&self) -> &History {
+        &self.history
     }
 
     pub fn view(&self) -> Option<View> {
@@ -126,39 +169,107 @@ impl Mirror {
 
     /// Translate a chunk of child output.
     pub fn process(&mut self, bytes: &[u8]) -> Output {
+        // Parse in slices, draining freshly scrolled-off rows into the
+        // history archive between slices so the staging buffer can't
+        // overflow even on a flood of one-byte lines.
+        for slice in bytes.chunks(PROCESS_SLICE) {
+            self.park();
+            self.parser.process(slice);
+            self.harvest();
+        }
+        let bells = self.take_bells();
+        let title = self.take_title_change();
         match self.view {
-            None => {
-                self.parser.process(bytes);
-                Output {
-                    host: bytes.to_vec(),
-                    remote: None,
-                    bells: self.take_bells(),
-                    // Pass-through already delivered the title sequence to
-                    // the host; this is for the session socket only.
-                    title: self.take_title_change(),
-                }
-            }
+            None => Output {
+                host: bytes.to_vec(),
+                remote: None,
+                bells,
+                // Pass-through already delivered the title sequence to
+                // the host; this is for the session socket only.
+                title,
+            },
             Some(_) => {
-                let prev = self.parser.screen().clone();
-                self.parser.process(bytes);
-                let bells = self.take_bells();
-                let title = self.take_title_change();
+                let shadow = self.shadow.as_mut().expect("shadow exists while viewing");
                 let screen = self.parser.screen();
-                let mut host = render_rows(screen, &prev, self.host_rows, self.host_cols, false);
+                let mut host =
+                    render_rows(screen, shadow.screen(), self.host_rows, self.host_cols, false);
                 // The render paths only reproduce screen contents, so a
                 // title change must be re-emitted to the host explicitly.
                 if let Some(t) = &title {
                     host.extend_from_slice(format!("\x1b]2;{t}\x07").as_bytes());
                 }
+                // The device terminal is exactly view-sized, so the
+                // same-size diff stream is correct for it.
+                let remote = Some(screen.state_diff(shadow.screen()));
+                shadow.process(bytes);
                 Output {
                     host,
-                    // The device terminal is exactly view-sized, so the
-                    // same-size diff stream is correct for it.
-                    remote: Some(screen.state_diff(&prev)),
+                    remote,
                     bells,
                     title,
                 }
             }
+        }
+    }
+
+    /// Number of rows currently in the staging scrollback.
+    fn staged_len(&mut self) -> usize {
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        screen.scrollback()
+    }
+
+    /// Arm the scroll counter before parsing a slice. Skipped while the app
+    /// is on the alternate screen (which has no scrollback of its own, and
+    /// during which the primary screen cannot scroll).
+    fn park(&mut self) {
+        if self.parser.screen().alternate_screen() {
+            return;
+        }
+        if !self.parked && self.staged_len() > 0 {
+            self.parser.screen_mut().set_scrollback(1);
+            self.parked = true;
+        } else if !self.parked {
+            self.parser.screen_mut().set_scrollback(0);
+        }
+    }
+
+    /// Archive rows that scrolled into the staging buffer since the last
+    /// harvest. Deferred (state kept) while the alternate screen is active.
+    fn harvest(&mut self) {
+        if self.parser.screen().alternate_screen() {
+            return;
+        }
+        let new_rows = if self.parked {
+            // Exact even if the staging buffer overflowed meanwhile.
+            self.parser.screen().scrollback().saturating_sub(1)
+        } else {
+            // Growth since last look; exact until the buffer first fills.
+            self.staged_len().saturating_sub(self.staged_seen)
+        };
+        self.parked = false;
+        if new_rows > 0 {
+            self.archive_staged_rows(new_rows);
+        }
+        self.staged_seen = self.staged_len();
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Serialize the newest `count` staged rows (oldest first) into history.
+    fn archive_staged_rows(&mut self, count: usize) {
+        let (rows, cols) = self.parser.screen().size();
+        let mut remaining = count.min(self.staged_len());
+        self.parser.screen_mut().set_scrollback(0);
+        while remaining > 0 {
+            // Scrolling back by `remaining` puts the oldest unarchived rows
+            // at the top of the visible window.
+            self.parser.screen_mut().set_scrollback(remaining);
+            let window = remaining.min(usize::from(rows));
+            for row in 0..window {
+                let record = serialize_row(self.parser.screen(), row as u16, cols);
+                self.history.push(record);
+            }
+            remaining -= window;
         }
     }
 
@@ -184,6 +295,7 @@ impl Mirror {
     /// The snapshot uses the bottom-left of the current viewport: the last
     /// `rows` rows and first `cols` columns that fit the device screen.
     pub fn start_view(&mut self, view: View) -> Transition {
+        self.flush_history_for_rebuild(view.rows);
         let snapshot = render_snapshot(self.parser.screen(), view.rows, view.cols);
 
         // Rebuild the model at device dimensions, primed with the snapshot,
@@ -192,6 +304,9 @@ impl Mirror {
         let mut parser = new_parser(view.rows, view.cols);
         parser.process(&snapshot);
         self.parser = parser;
+        let mut shadow = vt100::Parser::new(view.rows, view.cols, 0);
+        shadow.process(&snapshot);
+        self.shadow = Some(shadow);
         self.view = Some(view);
 
         let mut host_output = CLEAR.to_vec();
@@ -203,10 +318,40 @@ impl Mirror {
         }
     }
 
+    /// Before a parser rebuild (which discards the staging scrollback and,
+    /// for a bottom-anchored crop, the rows above the crop window), preserve
+    /// that content in the history archive: drain staged rows, then archive
+    /// visible rows that the crop will drop, up to the last non-blank one.
+    fn flush_history_for_rebuild(&mut self, keep_rows: u16) {
+        self.harvest();
+        if !self.parser.screen().alternate_screen() {
+            let (src_rows, src_cols) = self.parser.screen().size();
+            let dropped = usize::from(src_rows.saturating_sub(keep_rows));
+            let records: Vec<HistoryRecord> = (0..dropped)
+                .map(|row| serialize_row(self.parser.screen(), row as u16, src_cols))
+                .collect();
+            let last_nonblank = records.iter().rposition(|r| !r.bytes.is_empty());
+            if let Some(last) = last_nonblank {
+                for record in records.into_iter().take(last + 1) {
+                    self.history.push(record);
+                }
+            }
+        }
+        self.parked = false;
+        self.staged_seen = 0;
+    }
+
     /// The device stopped viewing (unview message, client disconnect, or
     /// simulated toggle): back to pass-through at host dimensions.
     pub fn end_view(&mut self) -> Transition {
+        // Drain staged history; the visible rows are not archived (they stay
+        // conceptually on screen — the app repaints them at host size, and a
+        // future view-start crop archives whatever ends up above the fold).
+        self.harvest();
+        self.parked = false;
+        self.staged_seen = 0;
         self.view = None;
+        self.shadow = None;
         self.parser = new_parser(self.host_rows, self.host_cols);
         // The child's SIGWINCH repaint will fill the host screen; reset any
         // input modes we enabled on the child's behalf, since from here on
@@ -228,6 +373,10 @@ impl Mirror {
             // Pass-through: forward the new size to the child; keep the
             // model in step (preserving contents for future snapshots).
             None => {
+                // Resizing clears wrap flags and can drop rows, so drain
+                // staged history first. (Staged rows themselves survive
+                // set_size.)
+                self.harvest();
                 self.parser.screen_mut().set_size(rows, cols);
                 Transition {
                     child_size: Some((rows, cols)),
@@ -359,6 +508,137 @@ fn place_cursor(out: &mut Vec<u8>, screen: &vt100::Screen, row_off: u16, rows: u
 
 fn cup(row: u16, col: u16) -> String {
     format!("\x1b[{};{}H", row + 1, col + 1)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct CellStyle {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+const DEFAULT_STYLE: CellStyle = CellStyle {
+    fg: vt100::Color::Default,
+    bg: vt100::Color::Default,
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+    inverse: false,
+};
+
+impl CellStyle {
+    fn of(cell: &vt100::Cell) -> Self {
+        Self {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    /// Whether a cell with no contents in this style is invisible (safe to
+    /// trim from the end of a line). A colored or inverted background is
+    /// content (back-color-erase paints cells this way).
+    fn blank_is_invisible(&self) -> bool {
+        self.bg == vt100::Color::Default && !self.inverse
+    }
+}
+
+/// Append one SGR sequence that switches from any style to `style`,
+/// starting with a full reset so the result is self-contained.
+fn emit_sgr(out: &mut Vec<u8>, style: &CellStyle) {
+    out.extend_from_slice(b"\x1b[0");
+    if style.bold {
+        out.extend_from_slice(b";1");
+    }
+    if style.dim {
+        out.extend_from_slice(b";2");
+    }
+    if style.italic {
+        out.extend_from_slice(b";3");
+    }
+    if style.underline {
+        out.extend_from_slice(b";4");
+    }
+    if style.inverse {
+        out.extend_from_slice(b";7");
+    }
+    emit_color(out, style.fg, false);
+    emit_color(out, style.bg, true);
+    out.push(b'm');
+}
+
+fn emit_color(out: &mut Vec<u8>, color: vt100::Color, background: bool) {
+    let base = if background { 10 } else { 0 };
+    match color {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(i) if i < 8 => {
+            out.extend_from_slice(format!(";{}", 30 + base + u16::from(i)).as_bytes());
+        }
+        vt100::Color::Idx(i) if i < 16 => {
+            out.extend_from_slice(format!(";{}", 82 + base + u16::from(i)).as_bytes());
+        }
+        vt100::Color::Idx(i) => {
+            out.extend_from_slice(format!(";{};5;{i}", 38 + base).as_bytes());
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            out.extend_from_slice(format!(";{};2;{r};{g};{b}", 38 + base).as_bytes());
+        }
+    }
+}
+
+/// Serialize one visible row into a self-contained history record: printable
+/// text plus SGR sequences only, starting from default attributes, trailing
+/// invisible cells trimmed. `width` is recorded as the layout width.
+fn serialize_row(screen: &vt100::Screen, row: u16, width: u16) -> HistoryRecord {
+    // Find the last cell that would be visible: contents, or a blank whose
+    // style shows (colored/inverted background).
+    let mut end = None;
+    for col in 0..width {
+        let Some(cell) = screen.cell(row, col) else { break };
+        let has_visible_contents =
+            cell.has_contents() && !(cell.contents() == " " && CellStyle::of(cell) == DEFAULT_STYLE);
+        if has_visible_contents || (!cell.has_contents() && !CellStyle::of(cell).blank_is_invisible())
+        {
+            end = Some(col);
+        }
+    }
+    let mut bytes = Vec::new();
+    if let Some(end) = end {
+        let mut current = DEFAULT_STYLE;
+        for col in 0..=end {
+            let Some(cell) = screen.cell(row, col) else { break };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let style = CellStyle::of(cell);
+            if style != current {
+                emit_sgr(&mut bytes, &style);
+                current = style;
+            }
+            if cell.has_contents() {
+                bytes.extend_from_slice(cell.contents().as_bytes());
+            } else {
+                bytes.push(b' ');
+            }
+            if bytes.len() >= MAX_LINE_BYTES {
+                break;
+            }
+        }
+    }
+    HistoryRecord {
+        bytes,
+        width,
+        wrapped: screen.row_wrapped(row),
+    }
 }
 
 #[cfg(test)]
@@ -595,6 +875,159 @@ mod tests {
 
         mirror.end_view();
         assert_eq!(mirror.title(), Some("during view"));
+    }
+
+    /// Render an archived record on a fresh single-row terminal.
+    fn render_record(record: &HistoryRecord) -> vt100::Parser {
+        let mut p = vt100::Parser::new(1, record.width, 0);
+        p.process(&record.bytes);
+        p
+    }
+
+    fn history_texts(mirror: &Mirror) -> Vec<String> {
+        let (next, oldest) = mirror.history_extent();
+        let (_, records) = mirror.history().fetch(next, (next - oldest) as u32);
+        records
+            .iter()
+            .map(|r| render_record(r).screen().contents().trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn scrolled_lines_are_archived_in_order_with_styles() {
+        let mut mirror = Mirror::new(3, 40);
+        mirror.process(b"plain\r\n\x1b[31mred line\x1b[0m\r\nthird\r\nfourth\r\nfifth");
+        // 5 lines through a 3-row screen: the first two scrolled off.
+        assert_eq!(history_texts(&mirror), vec!["plain", "red line"]);
+        let (_, records) = mirror.history().fetch(2, 10);
+        let rendered = render_record(records[1]);
+        let cell = rendered.screen().cell(0, 0).unwrap();
+        assert_eq!(cell.fgcolor(), vt100::Color::Idx(1), "styles preserved");
+        assert_eq!(records[1].width, 40);
+        assert!(!records[1].wrapped);
+    }
+
+    #[test]
+    fn soft_wrapped_lines_carry_wrap_flags() {
+        let mut mirror = Mirror::new(3, 10);
+        // 25 chars wrap into 3 rows; then enough lines to scroll them off.
+        let long: Vec<u8> = (0..25).map(|i| b'a' + (i % 26) as u8).collect();
+        mirror.process(&long);
+        mirror.process(b"\r\nx\r\ny\r\nz\r\nw");
+        let (next, _) = mirror.history_extent();
+        let (_, records) = mirror.history().fetch(next, 10);
+        let wrapped: Vec<bool> = records.iter().map(|r| r.wrapped).collect();
+        // The two full rows of the long line wrap; its final row does not.
+        assert_eq!(&wrapped[0..3], &[true, true, false]);
+    }
+
+    #[test]
+    fn flood_larger_than_staging_buffer_is_archived_completely() {
+        let mut mirror = Mirror::new(4, 20);
+        let mut bytes = Vec::new();
+        let count = STAGE_SCROLLBACK + 1500;
+        for i in 0..count {
+            bytes.extend_from_slice(format!("L{i}\r\n").as_bytes());
+        }
+        mirror.process(&bytes);
+        let (next, oldest) = mirror.history_extent();
+        assert_eq!(next, (count - 3) as u64, "all scrolled lines captured");
+        // Retention cap applies (default 10k > count here), continuity holds.
+        let (_, records) = mirror.history().fetch(next, 3);
+        let texts: Vec<String> = records
+            .iter()
+            .map(|r| render_record(r).screen().contents().trim_end().to_string())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                format!("L{}", count - 6),
+                format!("L{}", count - 5),
+                format!("L{}", count - 4)
+            ]
+        );
+        assert_eq!(oldest, 0);
+    }
+
+    #[test]
+    fn view_start_crop_flushes_rows_above_the_fold_to_history() {
+        let mut mirror = Mirror::new(6, 40);
+        let mut host = term(6, 40);
+        mirror.process(b"top-line\r\nsecond\r\n\r\n\r\n\r\nprompt");
+        // View is 3 rows tall: the bottom-anchored crop keeps rows 3..6;
+        // rows 0..3 are flushed to history (trailing blanks skipped).
+        let t = mirror.start_view(View {
+            rows: 3,
+            cols: 40,
+            simulated: true,
+        });
+        host.process(&t.host_output);
+        assert_eq!(history_texts(&mirror), vec!["top-line", "second"]);
+        // The snapshot itself shows the bottom of the screen.
+        let mut remote = term(3, 40);
+        remote.process(&t.remote_output.unwrap());
+        assert!(remote.screen().contents().contains("prompt"));
+    }
+
+    #[test]
+    fn alternate_screen_output_is_not_archived() {
+        let mut mirror = Mirror::new(3, 40);
+        mirror.process(b"before-alt\r\nsecond\r\nthird\r\nfourth");
+        let before = mirror.history_extent().0;
+        // Enter the alternate screen and scroll a lot inside it.
+        let mut alt = b"\x1b[?1049h".to_vec();
+        for i in 0..50 {
+            alt.extend_from_slice(format!("alt{i}\r\n").as_bytes());
+        }
+        alt.extend_from_slice(b"\x1b[?1049l");
+        mirror.process(&alt);
+        assert_eq!(
+            mirror.history_extent().0,
+            before,
+            "alt-screen scrolling must not create history"
+        );
+        // Scrolling on the primary screen still archives afterwards.
+        mirror.process(b"\r\nafter1\r\nafter2\r\nafter3\r\nafter4");
+        assert!(mirror.history_extent().0 > before);
+    }
+
+    #[test]
+    fn trailing_blanks_trim_but_colored_blanks_are_content() {
+        let mut mirror = Mirror::new(2, 20);
+        // Line 1: text plus trailing spaces. Line 2: a back-color-erased
+        // region (colored blanks) after text. Scroll both off.
+        mirror.process(b"hi      \r\nab\x1b[41m\x1b[K\x1b[0m\r\n1\r\n2");
+        let (_, records) = mirror.history().fetch(2, 10);
+        assert_eq!(records[0].bytes, b"hi");
+        let rendered = render_record(records[1]);
+        assert_eq!(rendered.screen().contents_between(0, 0, 0, 2), "ab");
+        let blank = rendered.screen().cell(0, 5).unwrap();
+        assert_eq!(
+            blank.bgcolor(),
+            vt100::Color::Idx(1),
+            "BCE-colored blanks survive archiving"
+        );
+    }
+
+    #[test]
+    fn history_width_tracks_the_layout_width_across_views() {
+        let mut mirror = Mirror::new(3, 40);
+        mirror.process(b"one\r\ntwo\r\nthree\r\nfour"); // "one" scrolls at 40
+        // A 2-row view: the crop flushes "two" (still at width 40), and
+        // lines scrolling during the view are laid out at 96.
+        mirror.start_view(View {
+            rows: 2,
+            cols: 96,
+            simulated: true,
+        });
+        mirror.process(b"\r\na\r\nb\r\nc"); // scrolls at 96
+        let (next, _) = mirror.history_extent();
+        let (_, records) = mirror.history().fetch(next, 10);
+        assert_eq!(records.first().unwrap().width, 40);
+        assert_eq!(records.last().unwrap().width, 96);
+        let texts = history_texts(&mirror);
+        assert!(texts.contains(&"two".to_string()), "crop flush at old width");
+        assert!(texts.contains(&"three".to_string()), "scrolled during view");
     }
 
     #[test]

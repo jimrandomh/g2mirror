@@ -47,7 +47,9 @@ cargo build
 
 `--title` sets the initial window title (shown in session lists and pushed
 to devices) for programs that never set one themselves; a program-set title
-takes over from there. The wrapped command's exit status is propagated, and
+takes over from there. Lines that scroll off screen (including before any
+device connects) are archived — 10,000 lines by default, `--scrollback`
+to change — and devices fetch them lazily in pages. The wrapped command's exit status is propagated, and
 a client watching when the program quits receives an `exit` message carrying
 that status. `cargo test` runs unit
 tests plus end-to-end tests of the session socket, the websocket server,

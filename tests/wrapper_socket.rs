@@ -409,6 +409,98 @@ async fn readonly_wrapper_rejects_input_without_dropping_connection() {
     wrapper.kill().await.ok();
 }
 
+#[tokio::test]
+async fn history_covers_output_scrolled_before_connect() {
+    let dir = test_dir("history");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        // 60 lines scroll through the 24-row (fallback-size) screen before
+        // any client connects.
+        .args(["sh", "-c", "seq 1 60; sleep 3"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket_path = find_socket(&dir, wrapper.id().unwrap()).await;
+
+    // Give the app time to finish printing before we look.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut viewer = BufReader::new(read_half);
+    let connect = read_msg(&mut viewer).await;
+    assert_eq!(connect["type"], "connect");
+    let next = connect["history"]["next"].as_u64().unwrap();
+    assert!(next > 30, "lines that scrolled pre-connect are archived");
+    assert_eq!(connect["history"]["oldest"], 0);
+
+    write_half
+        .write_all(
+            b"{\"type\":\"init\",\"version\":1,\"device\":\"t\",\"width\":96,\"height\":24}\n\
+              {\"type\":\"view\"}\n",
+        )
+        .await
+        .unwrap();
+    let snapshot = read_msg(&mut viewer).await;
+    assert_eq!(snapshot["type"], "snapshot");
+    let history_next = snapshot["history_next"].as_u64().unwrap();
+
+    // Page backwards until we have everything, then verify that history plus
+    // the snapshot cover all 60 numbers in order.
+    let mut texts: Vec<String> = Vec::new();
+    let mut before = history_next;
+    loop {
+        write_half
+            .write_all(format!("{{\"type\":\"history\",\"before\":{before},\"limit\":10}}\n").as_bytes())
+            .await
+            .unwrap();
+        let reply = loop {
+            let msg = read_msg(&mut viewer).await;
+            if msg["type"] == "history_lines" {
+                break msg;
+            }
+            assert_eq!(msg["type"], "output", "unexpected {msg}");
+        };
+        let lines = reply["lines"].as_array().unwrap();
+        let start = reply["start"].as_u64().unwrap();
+        let mut chunk: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                let mut p = vt100::Parser::new(1, l["width"].as_u64().unwrap() as u16, 0);
+                p.process(&base64_decode(l["data"].as_str().unwrap()));
+                p.screen().contents().trim_end().to_string()
+            })
+            .collect();
+        chunk.extend(texts);
+        texts = chunk;
+        if start == 0 {
+            break;
+        }
+        assert_eq!(lines.len(), 10, "full pages until the oldest line");
+        before = start;
+    }
+
+    let mut device = vt100::Parser::new(24, 96, 0);
+    device.process(&base64_decode(snapshot["data"].as_str().unwrap()));
+    let screen = device.screen().contents();
+    let all = format!("{}\n{}", texts.join("\n"), screen);
+    let numbers: Vec<u32> = all
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert_eq!(
+        numbers,
+        (1..=60).collect::<Vec<u32>>(),
+        "history plus snapshot must cover all output in order:\n{all}"
+    );
+
+    wrapper.kill().await.ok();
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)

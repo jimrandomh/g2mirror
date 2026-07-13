@@ -45,6 +45,11 @@ pub enum ToSession {
     /// an `error` message — without closing the connection — when the
     /// session is read-only.
     Input { data: String },
+    /// Request scrollback history: up to `limit` lines (default 500,
+    /// additionally capped by a reply byte budget) ending just before line
+    /// index `before`. Paginate backwards by passing the previous reply's
+    /// `start` as the next `before`.
+    History { before: u64, limit: Option<u32> },
 }
 
 /// Session protocol: wrapper -> client.
@@ -62,11 +67,15 @@ pub enum FromSession {
         /// True when the wrapper was started with --readonly; input
         /// messages will be rejected.
         readonly: bool,
+        /// Extent of the scrollback history archive.
+        history: HistoryExtent,
     },
     /// Full repaint of the device screen; sent on view. `data` is base64 of
     /// terminal bytes (escape sequences) to feed a fresh emulator of the
-    /// device's declared width/height.
-    Snapshot { data: String },
+    /// device's declared width/height. Every history line with index <
+    /// `history_next` is fetchable; lines the client witnesses scrolling
+    /// off its emulator after this snapshot continue from that index.
+    Snapshot { data: String, history_next: u64 },
     /// Incremental terminal output while viewing; base64, same encoding.
     Output { data: String },
     /// Sent to monitor connections when the app rings the terminal bell.
@@ -79,7 +88,35 @@ pub enum FromSession {
     Title { title: String },
     /// The wrapped app exited. The connection closes after this.
     Exit { status: Option<i32> },
+    /// Reply to a history request: lines `start..start+lines.len()` in
+    /// oldest-to-newest order, plus the current archive extent.
+    HistoryLines {
+        start: u64,
+        oldest: u64,
+        next: u64,
+        lines: Vec<HistoryLine>,
+    },
     Error { message: String },
+}
+
+/// Extent of the history archive: line indices `oldest..next` are fetchable.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HistoryExtent {
+    pub next: u64,
+    pub oldest: u64,
+}
+
+/// One archived line. `data` is base64 of self-contained styled text:
+/// printable characters and SGR sequences only, starting from default
+/// attributes (reset before rendering elsewhere). `width` is the column
+/// count the line was laid out at; `wrapped` means the line soft-wraps, so
+/// it and the following record form one logical line and may be re-wrapped
+/// at a different width.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryLine {
+    pub data: String,
+    pub width: u16,
+    pub wrapped: bool,
 }
 
 /// Server protocol: the device's first websocket message.

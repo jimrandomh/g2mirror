@@ -8,6 +8,7 @@
 //! without needing a real client.
 
 mod control;
+mod history;
 mod mirror;
 mod raw_guard;
 
@@ -15,7 +16,7 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 
 use anyhow::Context as _;
-use g2mirror::protocol::{self, FromSession, ToSession, PROTOCOL_VERSION};
+use g2mirror::protocol::{self, FromSession, HistoryExtent, HistoryLine, ToSession, PROTOCOL_VERSION};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -36,9 +37,15 @@ fn now_ms() -> u64 {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: g2mirror [--title <title>] [--readonly] <command> [args...]");
-    eprintln!("  --title     initial window title, until the program sets one itself");
-    eprintln!("  --readonly  reject input from connected devices");
+    eprintln!(
+        "usage: g2mirror [--title <title>] [--readonly] [--scrollback <lines>] <command> [args...]"
+    );
+    eprintln!("  --title       initial window title, until the program sets one itself");
+    eprintln!("  --readonly    reject input from connected devices");
+    eprintln!(
+        "  --scrollback  history lines retained for devices (default {})",
+        history::DEFAULT_MAX_LINES
+    );
     eprintln!("  Ctrl+G simulates glasses connect/disconnect");
     std::process::exit(2);
 }
@@ -47,6 +54,7 @@ fn main() {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut title: Option<String> = None;
     let mut readonly = false;
+    let mut scrollback = history::DEFAULT_MAX_LINES;
     let program = loop {
         let Some(arg) = args.next() else { usage() };
         match arg.to_str() {
@@ -61,6 +69,13 @@ fn main() {
                 title = Some(s["--title=".len()..].to_string());
             }
             Some("--readonly") => readonly = true,
+            Some("--scrollback") => match args.next().and_then(|v| v.to_str()?.parse().ok()) {
+                Some(lines) => scrollback = lines,
+                None => {
+                    eprintln!("g2mirror: --scrollback requires a number of lines");
+                    usage();
+                }
+            },
             Some("--") => match args.next() {
                 Some(program) => break program,
                 None => usage(),
@@ -78,7 +93,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    match runtime.block_on(run(program, args, title, readonly)) {
+    match runtime.block_on(run(program, args, title, readonly, scrollback)) {
         Ok(status) => std::process::exit(exit_code(status)),
         Err(e) => {
             eprintln!("g2mirror: {e:#}");
@@ -104,6 +119,7 @@ async fn run(
     args: Vec<std::ffi::OsString>,
     title: Option<String>,
     readonly: bool,
+    scrollback: usize,
 ) -> anyhow::Result<ExitStatus> {
     let (host_rows, host_cols) = host_size();
 
@@ -149,6 +165,7 @@ async fn run(
     let mut winch = signal(SignalKind::window_change())?;
 
     let mut mirror = Mirror::new(host_rows, host_cols);
+    mirror.set_history_limit(scrollback);
     if let Some(t) = title {
         // Show it on the host terminal too; strip control characters so an
         // exotic title can't break out of the escape sequence.
@@ -264,6 +281,10 @@ async fn run(
                         host_width: host_size().1,
                         host_height: host_size().0,
                         readonly,
+                        history: {
+                            let (next, oldest) = mirror.history_extent();
+                            HistoryExtent { next, oldest }
+                        },
                     };
                     if new_client.send(&connect).await.is_ok() {
                         pending = Some(new_client);
@@ -449,9 +470,36 @@ async fn handle_viewer_message(
             apply_transition(&t, pty_write, stdout).await?;
             let snapshot = FromSession::Snapshot {
                 data: protocol::encode_terminal_bytes(&t.remote_output.unwrap_or_default()),
+                // Everything archived so far (including rows just flushed
+                // by the view-start crop) predates this snapshot.
+                history_next: mirror.history_extent().0,
             };
             client.send(&snapshot).await?;
             client.state = ClientState::Viewing;
+            Ok(())
+        }
+        (ToSession::History { before, limit }, _) => {
+            let limit = limit
+                .unwrap_or(history::DEFAULT_FETCH_LIMIT)
+                .min(history::DEFAULT_FETCH_LIMIT);
+            let (start, records) = mirror.history().fetch(before, limit);
+            let (next, oldest) = mirror.history_extent();
+            let lines = records
+                .into_iter()
+                .map(|r| HistoryLine {
+                    data: protocol::encode_terminal_bytes(&r.bytes),
+                    width: r.width,
+                    wrapped: r.wrapped,
+                })
+                .collect();
+            client
+                .send(&FromSession::HistoryLines {
+                    start,
+                    oldest,
+                    next,
+                    lines,
+                })
+                .await?;
             Ok(())
         }
         (ToSession::Unview, ClientState::Viewing) => {
