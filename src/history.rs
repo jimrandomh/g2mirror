@@ -68,6 +68,13 @@ impl History {
         self.next - self.lines.len() as u64
     }
 
+    /// The newest `count` retained lines, oldest first, with no byte budget
+    /// (used for host-side scroll mirroring, where truncation would lose
+    /// lines from the host terminal's scrollback).
+    pub fn tail(&self, count: usize) -> impl Iterator<Item = &HistoryRecord> {
+        self.lines.iter().skip(self.lines.len().saturating_sub(count))
+    }
+
     /// Lines ending just before `before`, newest-bounded by `limit` and the
     /// reply byte budget, in oldest-to-newest order. Returns the index of
     /// the first returned line.

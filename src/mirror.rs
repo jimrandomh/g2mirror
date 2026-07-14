@@ -34,6 +34,11 @@ const PROCESS_SLICE: usize = 2048;
 
 const CLEAR: &[u8] = b"\x1b[0m\x1b[H\x1b[2J";
 const SGR_RESET: &[u8] = b"\x1b[0m";
+const CLEAR_TO_EOL: &[u8] = b"\x1b[K";
+/// Host prelude for a view: reset scroll margins, origin mode, and autowrap,
+/// since the bottom-anchored renderer relies on full-screen scrolls and
+/// absolute addressing. (An app that set these repaints after SIGWINCH.)
+const VIEW_HOST_PRELUDE: &[u8] = b"\x1b[r\x1b[?6l\x1b[?7h";
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
@@ -100,6 +105,10 @@ pub struct Mirror {
     /// Staging-buffer length after the last harvest, the fallback counter
     /// when parking wasn't possible.
     staged_seen: usize,
+    /// While viewing: whether the host's history zone (the rows above the
+    /// bottom-anchored live region) holds content that hasn't been pushed
+    /// into the host terminal's native scrollback yet.
+    zone_dirty: bool,
 }
 
 /// Result of processing a chunk of child output.
@@ -136,7 +145,32 @@ impl Mirror {
             history: History::new(DEFAULT_MAX_LINES),
             parked: false,
             staged_seen: 0,
+            zone_dirty: false,
         }
+    }
+
+    /// Host row where the live region starts while viewing: the region is
+    /// anchored at the bottom of the host screen, and the rows above it (the
+    /// history zone) scroll like a normal terminal.
+    fn region_offset(&self) -> u16 {
+        let region_rows = self
+            .view
+            .map_or(self.host_rows, |v| v.rows.min(self.host_rows));
+        self.host_rows - region_rows
+    }
+
+    /// Bytes that push the history zone's contents into the host terminal's
+    /// native scrollback (by scrolling the whole host screen up past it).
+    /// Used before anything clears the zone.
+    fn push_zone_to_host_scrollback(&self) -> Vec<u8> {
+        let zone_rows = self.region_offset();
+        if !self.zone_dirty || zone_rows == 0 {
+            return Vec::new();
+        }
+        let mut out = SGR_RESET.to_vec();
+        out.extend_from_slice(cup(self.host_rows.saturating_sub(1), 0).as_bytes());
+        out.extend_from_slice(&b"\r\n".repeat(usize::from(zone_rows)));
+        out
     }
 
     pub fn set_history_limit(&mut self, max_lines: usize) {
@@ -172,11 +206,13 @@ impl Mirror {
         // Parse in slices, draining freshly scrolled-off rows into the
         // history archive between slices so the staging buffer can't
         // overflow even on a flood of one-byte lines.
+        let history_before = self.history.next_index();
         for slice in bytes.chunks(PROCESS_SLICE) {
             self.park();
             self.parser.process(slice);
             self.harvest();
         }
+        let scrolled = (self.history.next_index() - history_before) as usize;
         let bells = self.take_bells();
         let title = self.take_title_change();
         match self.view {
@@ -188,11 +224,68 @@ impl Mirror {
                 // the host; this is for the session socket only.
                 title,
             },
-            Some(_) => {
+            Some(view) => {
+                let offset = self.region_offset();
+                let mut host = Vec::new();
+                if scrolled > 0 {
+                    // Mirror the scroll for real on the host so its native
+                    // scrollback accumulates: delete the live region's rows
+                    // (DL affects no scrollback), append the newly archived
+                    // lines as flowing text after the zone content, then
+                    // scroll just enough to clear the region area for the
+                    // repaint. Net effect: exactly `scrolled` rows push into
+                    // the host's scrollback, in order — the zone's oldest
+                    // rows followed by the oldest new lines — while the
+                    // newest lines settle in the zone directly above the
+                    // region. (Lines wider than the host wrap and consume
+                    // extra rows; order is still preserved.)
+                    let region_rows = view.rows.min(self.host_rows);
+                    host.extend_from_slice(SYNC_BEGIN);
+                    host.extend_from_slice(HIDE_CURSOR);
+                    host.extend_from_slice(SGR_RESET);
+                    host.extend_from_slice(cup(offset, 0).as_bytes());
+                    host.extend_from_slice(format!("\x1b[{region_rows}M").as_bytes());
+                    for (i, record) in self.history.tail(scrolled).enumerate() {
+                        if i > 0 {
+                            host.extend_from_slice(b"\r\n");
+                        }
+                        host.extend_from_slice(&record.bytes);
+                        host.extend_from_slice(SGR_RESET);
+                    }
+                    host.extend_from_slice(
+                        cup(self.host_rows.saturating_sub(1), 0).as_bytes(),
+                    );
+                    host.extend_from_slice(
+                        &b"\r\n".repeat(scrolled.min(usize::from(region_rows))),
+                    );
+                    host.extend_from_slice(SYNC_END);
+                    self.zone_dirty = true;
+                }
                 let shadow = self.shadow.as_mut().expect("shadow exists while viewing");
                 let screen = self.parser.screen();
-                let mut host =
-                    render_rows(screen, shadow.screen(), self.host_rows, self.host_cols, false);
+                if scrolled > 0 {
+                    // The scroll shifted the whole host screen, so the
+                    // region contents are unknown: clear-and-redraw it.
+                    let (rows, cols) = screen.size();
+                    let blank = blank_screen(rows, cols);
+                    host.extend_from_slice(&render_rows(
+                        screen,
+                        &blank,
+                        self.host_rows,
+                        self.host_cols,
+                        true,
+                        offset,
+                    ));
+                } else {
+                    host.extend_from_slice(&render_rows(
+                        screen,
+                        shadow.screen(),
+                        self.host_rows,
+                        self.host_cols,
+                        false,
+                        offset,
+                    ));
+                }
                 // The render paths only reproduce screen contents, so a
                 // title change must be re-emitted to the host explicitly.
                 if let Some(t) = &title {
@@ -308,8 +401,13 @@ impl Mirror {
         shadow.process(&snapshot);
         self.shadow = Some(shadow);
         self.view = Some(view);
+        self.zone_dirty = false;
 
-        let mut host_output = CLEAR.to_vec();
+        // No clear: the live region redraws the bottom of the host screen
+        // in place (it shows the same bottom-anchored content the host was
+        // already displaying), and whatever is above it stays visible as
+        // the initial history zone.
+        let mut host_output = VIEW_HOST_PRELUDE.to_vec();
         host_output.extend_from_slice(&self.render_host_full());
         Transition {
             child_size: Some((view.rows, view.cols)),
@@ -350,13 +448,17 @@ impl Mirror {
         self.harvest();
         self.parked = false;
         self.staged_seen = 0;
+        // Preserve the history zone in the host's native scrollback before
+        // clearing wipes it.
+        let mut host_output = self.push_zone_to_host_scrollback();
+        self.zone_dirty = false;
         self.view = None;
         self.shadow = None;
         self.parser = new_parser(self.host_rows, self.host_cols);
         // The child's SIGWINCH repaint will fill the host screen; reset any
         // input modes we enabled on the child's behalf, since from here on
         // the child manages the host terminal directly.
-        let mut host_output = CLEAR.to_vec();
+        host_output.extend_from_slice(CLEAR);
         host_output.extend_from_slice(RESET_INPUT_MODES);
         Transition {
             child_size: Some((self.host_rows, self.host_cols)),
@@ -384,10 +486,13 @@ impl Mirror {
                     remote_output: None,
                 }
             }
-            // The device screen stays at its fixed size; only our truncation
-            // window changed, so repaint the whole host frame.
+            // The device screen stays at its fixed size; only our layout on
+            // the host changed, so repaint the whole host frame (after
+            // rescuing the history zone into the host's scrollback).
             Some(_) => {
-                let mut host_output = CLEAR.to_vec();
+                let mut host_output = self.push_zone_to_host_scrollback();
+                self.zone_dirty = false;
+                host_output.extend_from_slice(CLEAR);
                 host_output.extend_from_slice(&self.render_host_full());
                 Transition {
                     child_size: None,
@@ -404,7 +509,14 @@ impl Mirror {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
         let blank = blank_screen(rows, cols);
-        render_rows(screen, &blank, self.host_rows, self.host_cols, true)
+        render_rows(
+            screen,
+            &blank,
+            self.host_rows,
+            self.host_cols,
+            true,
+            self.region_offset(),
+        )
     }
 
     /// Bytes to restore the host terminal when exiting while a view is
@@ -412,12 +524,14 @@ impl Mirror {
     pub fn cleanup(&self) -> Vec<u8> {
         match self.view {
             None => Vec::new(),
-            Some(view) => {
-                let mut out = SGR_RESET.to_vec();
+            Some(_) => {
+                // Rescue the history zone first; the final screen contents
+                // stay visible above the shell prompt that follows.
+                let mut out = self.push_zone_to_host_scrollback();
+                out.extend_from_slice(SGR_RESET);
                 out.extend_from_slice(SHOW_CURSOR);
                 out.extend_from_slice(RESET_INPUT_MODES);
-                let last_row = self.host_rows.min(view.rows);
-                out.extend_from_slice(cup(last_row.saturating_sub(1), 0).as_bytes());
+                out.extend_from_slice(cup(self.host_rows.saturating_sub(1), 0).as_bytes());
                 out.extend_from_slice(b"\r\n");
                 out
             }
@@ -430,16 +544,20 @@ fn blank_screen(rows: u16, cols: u16) -> vt100::Screen {
 }
 
 /// Render the part of `screen` that fits in a `host_rows` x `host_cols`
-/// terminal, as a diff from `prev` (same size as `screen`). Every row is
+/// terminal, as a diff from `prev` (same size as `screen`), placed with its
+/// top at host row `row_offset` (the live region is anchored at the bottom
+/// of the host screen; rows above it are the history zone). Every row is
 /// explicitly positioned, so the output is correct on any terminal at least
-/// as large as the rendered window — regions outside the window are never
-/// touched. `full` selects full-state emission (fresh target) vs diff.
+/// as large as the rendered window. `full` selects full-state emission for
+/// a target whose region contents are unknown: every region row is cleared
+/// and redrawn rather than diffed.
 fn render_rows(
     screen: &vt100::Screen,
     prev: &vt100::Screen,
     host_rows: u16,
     host_cols: u16,
     full: bool,
+    row_offset: u16,
 ) -> Vec<u8> {
     let (screen_rows, screen_cols) = screen.size();
     let rows = host_rows.min(screen_rows);
@@ -451,9 +569,14 @@ fn render_rows(
         .take(rows.into())
         .enumerate()
     {
-        if !row_diff.is_empty() {
+        if full {
             out.extend_from_slice(SGR_RESET);
-            out.extend_from_slice(cup(i as u16, 0).as_bytes());
+            out.extend_from_slice(cup(row_offset + i as u16, 0).as_bytes());
+            out.extend_from_slice(CLEAR_TO_EOL);
+            out.extend_from_slice(&row_diff);
+        } else if !row_diff.is_empty() {
+            out.extend_from_slice(SGR_RESET);
+            out.extend_from_slice(cup(row_offset + i as u16, 0).as_bytes());
             out.extend_from_slice(&row_diff);
         }
     }
@@ -462,7 +585,7 @@ fn render_rows(
     } else {
         out.extend_from_slice(&screen.input_mode_diff(prev));
     }
-    place_cursor(&mut out, screen, 0, rows, cols);
+    place_cursor(&mut out, screen, 0, rows, cols, row_offset);
     out.extend_from_slice(SYNC_END);
     out
 }
@@ -490,18 +613,26 @@ fn render_snapshot(src: &vt100::Screen, rows: u16, cols: u16) -> Vec<u8> {
         }
     }
     out.extend_from_slice(&src.input_mode_formatted());
-    place_cursor(&mut out, src, row_off, rows, cols);
+    place_cursor(&mut out, src, row_off, rows, cols, 0);
     out.extend_from_slice(SYNC_END);
     out
 }
 
 /// Position the target cursor at the screen's cursor if it falls inside the
-/// rendered window (`row_off..row_off+rows`, `0..cols`); otherwise leave it
-/// hidden (render helpers hide it up front).
-fn place_cursor(out: &mut Vec<u8>, screen: &vt100::Screen, row_off: u16, rows: u16, cols: u16) {
+/// rendered window (source rows `src_off..src_off+rows`, cols `0..cols`),
+/// drawn at target rows starting at `target_off`; otherwise leave it hidden
+/// (render helpers hide it up front).
+fn place_cursor(
+    out: &mut Vec<u8>,
+    screen: &vt100::Screen,
+    src_off: u16,
+    rows: u16,
+    cols: u16,
+    target_off: u16,
+) {
     let (row, col) = screen.cursor_position();
-    if !screen.hide_cursor() && row >= row_off && row - row_off < rows && col < cols {
-        out.extend_from_slice(cup(row - row_off, col).as_bytes());
+    if !screen.hide_cursor() && row >= src_off && row - src_off < rows && col < cols {
+        out.extend_from_slice(cup(target_off + row - src_off, col).as_bytes());
         out.extend_from_slice(SHOW_CURSOR);
     }
 }
@@ -686,9 +817,11 @@ mod tests {
         start_view(&mut mirror, &mut host);
         let out = mirror.process(b"hello\r\nworld");
         host.process(&out.host);
-        assert_eq!(host.screen().contents_between(0, 0, 0, 5), "hello");
-        assert_eq!(host.screen().contents_between(1, 0, 1, 5), "world");
-        assert_eq!(host.screen().cursor_position(), (1, 5));
+        // The live region is anchored at the bottom of the host screen:
+        // view row 0 lands at host row 40 - 24 = 16.
+        assert_eq!(host.screen().contents_between(16, 0, 16, 5), "hello");
+        assert_eq!(host.screen().contents_between(17, 0, 17, 5), "world");
+        assert_eq!(host.screen().cursor_position(), (17, 5));
     }
 
     /// Regression test: a line that wraps in the view model must not spill
@@ -700,38 +833,50 @@ mod tests {
         let mut mirror = Mirror::new(40, 150);
         let mut host = term(40, 150);
         start_view(&mut mirror, &mut host);
-        // 150 chars: wraps at col 96 in the model into two rows.
+        // 150 chars: wraps at col 96 in the model into two rows. Region
+        // starts at host row 16 (40 - 24).
         let long: Vec<u8> = (0..150).map(|i| b'a' + (i % 26) as u8).collect();
         let out = mirror.process(&long);
         host.process(&out.host);
-        let row0 = host.screen().contents_between(0, 0, 0, 150);
-        assert_eq!(row0.len(), 96, "row 0 must stop at the view width");
-        // The wrapped remainder appears on row 1, not in cols 97-150 of row 0.
+        let row0 = host.screen().contents_between(16, 0, 16, 150);
+        assert_eq!(row0.len(), 96, "row must stop at the view width");
+        // The wrapped remainder appears on the next row, not in cols 97-150.
         assert_eq!(
-            host.screen().contents_between(1, 0, 1, 150),
+            host.screen().contents_between(17, 0, 17, 150),
             String::from_utf8_lossy(&long[96..])
         );
     }
 
-    /// Regression test: stale host content right of the view region is
-    /// cleared at view start and never re-painted by later diffs.
+    /// Stale host content inside the live region (including right of the
+    /// view width) is cleared when the view starts, while content in the
+    /// history zone above the region deliberately stays on screen.
     #[test]
-    fn stale_wide_content_cleared_when_view_starts() {
+    fn view_start_clears_region_but_preserves_zone() {
         let mut mirror = Mirror::new(40, 150);
         let mut host = term(40, 150);
-        // Local mode: app paints all the way out to col 150.
-        let wide = b"\x1b[1;120Hstale-right\x1b[30;1Hbottom";
+        // Local mode: content in the future zone (row 5), and content in the
+        // future region rows painted out to col 150.
+        let wide = b"\x1b[5;1Hzone-note\x1b[30;120Hstale-right\x1b[40;1Hbottom";
         host.process(&mirror.process(wide).host);
         assert!(host.screen().contents().contains("stale-right"));
 
+        // Region occupies host rows 16..40; the snapshot crop keeps model
+        // rows 16..40, cropped to 96 cols — so "stale-right" (row 30, col
+        // 120) must be wiped by the region redraw, while "zone-note" stays.
         start_view(&mut mirror, &mut host);
+        // "bottom" (model row 39) is inside the crop and redrawn in place.
+        assert_eq!(host.screen().contents_between(39, 0, 39, 6), "bottom");
         let out = mirror.process(b"\x1b[2J\x1b[Hfresh");
         host.process(&out.host);
         assert!(
             !host.screen().contents().contains("stale-right"),
-            "content right of the view region must be cleared"
+            "region content right of the view width must be cleared"
         );
         assert!(host.screen().contents().contains("fresh"));
+        assert!(
+            host.screen().contents().contains("zone-note"),
+            "pre-view content above the region stays visible"
+        );
     }
 
     #[test]
@@ -1028,6 +1173,70 @@ mod tests {
         let texts = history_texts(&mirror);
         assert!(texts.contains(&"two".to_string()), "crop flush at old width");
         assert!(texts.contains(&"three".to_string()), "scrolled during view");
+    }
+
+    /// All lines (scrollback plus screen) of a host emulator, oldest first,
+    /// trimmed, with blank lines dropped.
+    fn host_lines(host: &mut vt100::Parser) -> Vec<String> {
+        host.screen_mut().set_scrollback(usize::MAX);
+        let total = host.screen().scrollback();
+        let mut lines = Vec::new();
+        for i in 0..total {
+            host.screen_mut().set_scrollback(total - i);
+            lines.push(host.screen().rows(0, 200).next().unwrap_or_default());
+        }
+        host.screen_mut().set_scrollback(0);
+        lines.extend(host.screen().rows(0, 200));
+        lines
+            .into_iter()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn viewing_scrolls_reach_the_host_terminals_native_scrollback() {
+        let mut mirror = Mirror::new(6, 40);
+        // Host emulator with real scrollback, like the user's terminal.
+        let mut host = vt100::Parser::new(6, 40, 100);
+        let t = mirror.start_view(View {
+            rows: 3,
+            cols: 40,
+            simulated: true,
+        });
+        host.process(&t.host_output);
+        // Ten lines through a 3-row view: 7 scroll off (more than the
+        // region holds, exercising the flood path too).
+        let mut bytes = Vec::new();
+        for i in 1..=10 {
+            bytes.extend_from_slice(format!("L{i}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"end");
+        host.process(&mirror.process(&bytes).host);
+
+        let lines = host_lines(&mut host);
+        let expected: Vec<String> = (1..=10)
+            .map(|i| format!("L{i}"))
+            .chain(["end".to_string()])
+            .collect();
+        assert_eq!(
+            lines, expected,
+            "host scrollback + zone + region must show every line in order"
+        );
+
+        // Detaching pushes the zone into the host's scrollback before
+        // clearing, so nothing that scrolled during the view is lost.
+        let t = mirror.end_view();
+        host.process(&t.host_output);
+        let lines = host_lines(&mut host);
+        // The model ended showing L9/L10/end, which never scrolled and stay
+        // the app's to repaint; every line that DID scroll (L1..L8) must be
+        // in the host's scrollback after the zone push + clear.
+        let scrolled: Vec<String> = (1..=8).map(|i| format!("L{i}")).collect();
+        assert_eq!(
+            lines, scrolled,
+            "after unview, every scrolled line is in scrollback"
+        );
     }
 
     #[test]

@@ -49,7 +49,13 @@ cargo build
 to devices) for programs that never set one themselves; a program-set title
 takes over from there. Lines that scroll off screen (including before any
 device connects) are archived — 10,000 lines by default, `--scrollback`
-to change — and devices fetch them lazily in pages. The wrapped command's exit status is propagated, and
+to change — and devices fetch them lazily in pages.
+
+While a device is viewing, the host terminal shows the live view anchored
+at the bottom of the screen, with scrolled lines flowing up above it and
+into the host terminal's own native scrollback in real time — so
+scrolling up in your terminal works during and after a view, and
+detaching preserves everything that scrolled. The wrapped command's exit status is propagated, and
 a client watching when the program quits receives an `exit` message carrying
 that status. `cargo test` runs unit
 tests plus end-to-end tests of the session socket, the websocket server,
