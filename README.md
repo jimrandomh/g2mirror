@@ -20,7 +20,7 @@ truncated.
   connect/disconnect at 96×24 without a real client.
 - **`g2mirror-server`** — a websocket gateway for device drivers. Reads
   `~/.g2mirror/config.json` (create it with `g2mirror-server
-  --init-config`, which prints the auth token once), cleans up stale
+  --init-config`, which prints the first auth token once), cleans up stale
   session sockets, authenticates devices, lists sessions, and relays
   messages. It listens on a private address (loopback by default);
   encryption is delegated to tailscale or an ssh tunnel. It also keeps a
@@ -28,11 +28,60 @@ truncated.
   bell, pushing debounced bell notifications to connected devices — useful
   for watching AI agents and other long-running programs that ring the
   terminal bell (`printf '\a'`) when they want attention.
+- **`g2mirror-view`** — a terminal client for humans without glasses
+  (e.g. a coworker following a shared project). `g2mirror-view
+  g2mirror://<token>@<host>[:port]` shows the list of live terminals
+  (arrows + enter to attach, `q` to quit); attaching prints recent
+  scrollback history into your terminal's own scrollback, then mirrors the
+  live viewport. **Ctrl+D** detaches back to the list; every other key is
+  forwarded to the wrapped app unless the token or session is read-only.
 
 See [PROTOCOL.md](PROTOCOL.md) for the full protocol (aimed at glasses-
-driver implementers). Devices can send input (e.g. voice-to-text) unless
-the wrapper was started with `--readonly` or the server config sets
-`"readonly": true`.
+driver implementers).
+
+## Tokens, permissions, and sizing
+
+The server config holds an `auth_tokens` array; each entry has a `name`, a
+`token_hash`, and a `readonly` flag (**default true** — add tokens with
+`g2mirror-server --add-token <name>`, or `--add-token <name> --writable`
+for one that may send input). A viewer can send input (e.g. voice-to-text)
+only if its token is writable *and* the wrapper wasn't started with
+`--readonly`. Legacy configs with a single `auth_token_hash` still work
+(as a writable token named `default`).
+
+A token can also be restricted to a subset of terminals with a `filter`
+array:
+
+```json
+{"name": "robert", "token_hash": "…", "readonly": true,
+ "filter": [
+   {"path": "/Users/jim/repositories/shared-project.*"},
+   {"windowtitle": ".*SHARED.*"}
+ ]}
+```
+
+A terminal is visible when **any** rule matches; within one rule every
+present field must match. `path` is matched against the session's real
+working directory and `windowtitle` against its current title; both are
+regexes anchored at both ends. Filters govern everything: hidden terminals
+are absent from `list`, refuse `connect`, and produce no bell/title
+notifications — and since a title change can toggle visibility (handy as
+an on/off switch: have the program or your prompt set a title containing a
+marker like `SHARED`), a viewer attached to a terminal that stops matching
+is disconnected on the spot. Unknown rule keys and invalid regexes are
+config errors, so a typo fails at startup instead of silently widening
+access.
+
+Several viewers can view one terminal at the same time; they all receive
+the same stream. Which of them sets the wrapped app's *size* is the
+`size_precedence` config list — an ordered list of token names plus
+`"host"` (the host terminal), e.g. `["glasses", "host", "spectator"]`:
+the app is sized to the earliest listed party that is currently viewing
+(`"host"` always counts as present). Everyone ranked lower gets a stream
+at that size, cropped bottom-left to fit their screen — g2mirror-view
+tolerates this mismatch natively, and re-synchronizes automatically when
+the stream size changes. Unlisted tokens rank below everything listed;
+with no list at all, any viewer resizes the app (the original behavior).
 
 ## Build & run
 
@@ -41,8 +90,11 @@ cargo build
 ./target/debug/g2mirror htop           # press Ctrl+G to toggle the simulated view
 ./target/debug/g2mirror --title "build watcher" -- make watch
 
-./target/debug/g2mirror-server --init-config   # once; prints the auth token
+./target/debug/g2mirror-server --init-config   # once; prints the "glasses" token
+./target/debug/g2mirror-server --add-token spectator   # a read-only coworker token
 ./target/debug/g2mirror-server                 # ws://127.0.0.1:8737
+
+./target/debug/g2mirror-view "g2mirror://<token>@127.0.0.1:8737"
 ```
 
 `--title` sets the initial window title (shown in session lists and pushed
@@ -64,9 +116,10 @@ and the full device→server→wrapper chain.
 ## Layout
 
 - `src/main.rs` — wrapper: pty + child spawn, raw mode, event loop
-- `src/mirror.rs` — view state machine and vt100-based output translation
 - `src/control.rs` — session socket listener/client framing
-- `src/raw_guard.rs` — RAII raw-mode guard for the host terminal
-- `src/protocol.rs`, `src/paths.rs` — shared library (message types,
-  ~/.g2mirror handling)
+- `src/lib.rs` etc. — shared library: `mirror` (view state machine and
+  vt100-based output translation, also used by the viewer for its local
+  rendering), `history` (scrollback archive), `protocol` (message types),
+  `paths` (~/.g2mirror handling), `raw_guard` (RAII raw-mode guard)
 - `src/bin/g2mirror-server.rs` — websocket gateway
+- `src/bin/g2mirror-view.rs` — terminal viewer client

@@ -501,6 +501,118 @@ async fn history_covers_output_scrolled_before_connect() {
     wrapper.kill().await.ok();
 }
 
+/// Read messages until one of the wanted type arrives (skipping unrelated
+/// stream traffic like output chunks).
+async fn next_of_type(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    wanted: &str,
+) -> Value {
+    loop {
+        let msg = read_msg(reader).await;
+        if msg["type"] == wanted {
+            return msg;
+        }
+    }
+}
+
+#[tokio::test]
+async fn size_precedence_across_multiple_viewers() {
+    let dir = test_dir("multi");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["cat"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket_path = find_socket(&dir, wrapper.id().unwrap()).await;
+
+    // Viewer A: a spectator ranked below the host terminal (ranks as the
+    // server would compute from size_precedence ["glasses","host","spec"]).
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (a_read, mut a_write) = stream.into_split();
+    let mut a = BufReader::new(a_read);
+    assert_eq!(read_msg(&mut a).await["type"], "connect");
+    a_write
+        .write_all(
+            b"{\"type\":\"init\",\"version\":1,\"device\":\"spec\",\"width\":60,\"height\":20,\
+               \"size_rank\":2,\"host_size_rank\":1}\n\
+              {\"type\":\"view\"}\n",
+        )
+        .await
+        .unwrap();
+    // The host outranks the spectator, so the stream is host-sized (the
+    // fallback 80x24 here), not the spectator's 60x20.
+    let snap_a = next_of_type(&mut a, "snapshot").await;
+    assert_eq!((snap_a["width"].as_u64(), snap_a["height"].as_u64()), (Some(80), Some(24)));
+
+    // Viewer B: glasses ranked above the host. Both clients get fresh
+    // snapshots at the new stream size.
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (b_read, mut b_write) = stream.into_split();
+    let mut b = BufReader::new(b_read);
+    assert_eq!(read_msg(&mut b).await["type"], "connect");
+    b_write
+        .write_all(
+            b"{\"type\":\"init\",\"version\":1,\"device\":\"glasses\",\"width\":96,\"height\":24,\
+               \"size_rank\":0,\"host_size_rank\":1}\n\
+              {\"type\":\"view\"}\n",
+        )
+        .await
+        .unwrap();
+    let snap_b = next_of_type(&mut b, "snapshot").await;
+    assert_eq!((snap_b["width"].as_u64(), snap_b["height"].as_u64()), (Some(96), Some(24)));
+    let resnap_a = next_of_type(&mut a, "snapshot").await;
+    assert_eq!(
+        (resnap_a["width"].as_u64(), resnap_a["height"].as_u64()),
+        (Some(96), Some(24)),
+        "the other viewer is re-snapshotted at the new stream size"
+    );
+
+    // Output is broadcast to every viewing client: input sent by B echoes
+    // (via cat) into both A's and B's streams.
+    let input = base64_encode(b"shared-echo\r");
+    b_write
+        .write_all(format!("{{\"type\":\"input\",\"data\":\"{input}\"}}\n").as_bytes())
+        .await
+        .unwrap();
+    for (reader, snap) in [(&mut a, &resnap_a), (&mut b, &snap_b)] {
+        let mut term = vt100::Parser::new(24, 96, 0);
+        term.process(&base64_decode(snap["data"].as_str().unwrap()));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !term.screen().contents().contains("shared-echo") {
+            assert!(tokio::time::Instant::now() < deadline, "echo never arrived");
+            let msg = next_of_type(reader, "output").await;
+            term.process(&base64_decode(msg["data"].as_str().unwrap()));
+        }
+    }
+
+    // B stops viewing: the stream falls back to host size for A...
+    b_write.write_all(b"{\"type\":\"unview\"}\n").await.unwrap();
+    let resnap_a = next_of_type(&mut a, "snapshot").await;
+    assert_eq!((resnap_a["width"].as_u64(), resnap_a["height"].as_u64()), (Some(80), Some(24)));
+    // ...while B, no longer viewing, goes quiet. (Output broadcast before
+    // the unview took effect — the pty echo and cat's output are separate
+    // chunks — may still be in flight; a snapshot must not be.)
+    loop {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_millis(500), b.read_line(&mut line)).await {
+            Err(_) => break, // quiet
+            Ok(read) => {
+                read.unwrap();
+                assert!(!line.is_empty(), "wrapper closed B's connection");
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(msg["type"], "output", "non-viewing client received: {msg}");
+            }
+        }
+    }
+
+    wrapper.kill().await.ok();
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)

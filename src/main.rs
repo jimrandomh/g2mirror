@@ -8,15 +8,13 @@
 //! without needing a real client.
 
 mod control;
-mod history;
-mod mirror;
-mod raw_guard;
 
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 
 use anyhow::Context as _;
 use g2mirror::protocol::{self, FromSession, HistoryExtent, HistoryLine, ToSession, PROTOCOL_VERSION};
+use g2mirror::{history, mirror, raw_guard};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -176,13 +174,21 @@ async fn run(
         stdout.flush().await?;
         mirror.set_title(clean);
     }
-    // Connection slots: a freshly accepted connection is `pending` until its
-    // first message classifies it as the viewer (a device, via init) or the
-    // monitor (g2mirror-server, via monitor). One of each at a time; the
-    // monitor does not count as a viewer.
-    let mut pending: Option<Client> = None;
-    let mut viewer: Option<Client> = None;
+    // Connection slots: a freshly accepted connection is pending until its
+    // first message classifies it as a viewer (a device, via init) or the
+    // monitor (g2mirror-server, via monitor; at most one, and it does not
+    // count as a viewer). Several viewers may be connected and viewing at
+    // once; the wrapped app is sized to the best-ranked viewing client (or
+    // left at host size when the host outranks them all), and everyone gets
+    // the same output stream at that size.
+    let mut pendings: Vec<Client> = Vec::new();
+    let mut viewers: Vec<Client> = Vec::new();
     let mut monitor: Option<Client> = None;
+    // Rank of the host terminal in the size-precedence order, as reported
+    // by the most recent init; until one says otherwise, viewers outrank
+    // the host.
+    let mut host_rank: u32 = u32::MAX;
+    let mut next_client_id: u64 = 0;
     let mut bell = BellDebouncer::new(BELL_DEBOUNCE);
     let mut stdin_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 64 * 1024];
@@ -219,23 +225,34 @@ async fn run(
                         && let Some(at) = bell.on_bell(std::time::Instant::now(), now_ms()) {
                             send_bell(&mut monitor, at).await;
                         }
-                    if let (Some(data), Some(c)) = (out.remote, viewer.as_mut())
-                        && c.state == ClientState::Viewing && !data.is_empty() {
+                    let mut lost_one = false;
+                    if let Some(data) = out.remote
+                        && !data.is_empty() {
                             let msg = FromSession::Output {
                                 data: protocol::encode_terminal_bytes(&data),
                             };
-                            if c.send(&msg).await.is_err() {
-                                drop_viewer(&mut viewer, &mut mirror, &pty_write, &mut stdout)
-                                    .await?;
+                            for c in viewers.iter_mut()
+                                .filter(|c| c.state == ClientState::Viewing) {
+                                if c.send(&msg).await.is_err() {
+                                    c.dead = true;
+                                    lost_one = true;
+                                }
                             }
                         }
                     if let Some(title) = out.title {
                         send_title(&mut monitor, &title).await;
-                        if let Some(c) = viewer.as_mut()
-                            && c.send(&FromSession::Title { title }).await.is_err() {
-                                drop_viewer(&mut viewer, &mut mirror, &pty_write, &mut stdout)
-                                    .await?;
+                        let msg = FromSession::Title { title };
+                        for c in viewers.iter_mut() {
+                            if c.send(&msg).await.is_err() {
+                                c.dead = true;
+                                lost_one = true;
                             }
+                        }
+                    }
+                    if lost_one {
+                        sweep_and_refresh(
+                            &mut viewers, &mut mirror, host_rank, &pty_write, &mut stdout,
+                        ).await?;
                     }
                 }
             },
@@ -257,47 +274,43 @@ async fn run(
                 let (rows, cols) = host_size();
                 let t = mirror.host_resized(rows, cols);
                 apply_transition(&t, &pty_write, &mut stdout).await?;
+                // If the host outranks the viewers, the view size follows.
+                sweep_and_refresh(&mut viewers, &mut mirror, host_rank, &pty_write, &mut stdout)
+                    .await?;
             }
 
             // A new connection: greet it and wait for its first message.
             conn = control.accept() => {
                 let stream = conn.context("session socket accept failed")?;
-                let mut new_client = Client::new(stream);
-                if pending.is_some() {
-                    let _ = new_client
-                        .send(&FromSession::Error {
-                            message: "another connection is being set up; retry".into(),
-                        })
-                        .await;
-                    // new_client dropped, connection closes.
-                } else {
-                    let connect = FromSession::Connect {
-                        version: PROTOCOL_VERSION,
-                        pid: std::process::id(),
-                        command: command_line.clone(),
-                        cwd: std::env::current_dir()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        host_width: host_size().1,
-                        host_height: host_size().0,
-                        readonly,
-                        history: {
-                            let (next, oldest) = mirror.history_extent();
-                            HistoryExtent { next, oldest }
-                        },
-                    };
-                    if new_client.send(&connect).await.is_ok() {
-                        pending = Some(new_client);
-                    }
+                let mut new_client = Client::new(stream, next_client_id);
+                next_client_id += 1;
+                let connect = FromSession::Connect {
+                    version: PROTOCOL_VERSION,
+                    pid: std::process::id(),
+                    command: command_line.clone(),
+                    cwd: std::env::current_dir()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    host_width: host_size().1,
+                    host_height: host_size().0,
+                    readonly,
+                    history: {
+                        let (next, oldest) = mirror.history_extent();
+                        HistoryExtent { next, oldest }
+                    },
+                };
+                if new_client.send(&connect).await.is_ok() {
+                    pendings.push(new_client);
                 }
             }
 
             // A pending connection's first message classifies it.
-            msg = async { pending.as_mut().unwrap().next_message().await },
-                    if pending.is_some() => {
-                let mut p = pending.take().unwrap();
+            (i, msg) = next_from_any(&mut pendings), if !pendings.is_empty() => {
+                let mut p = pendings.remove(i);
                 match msg {
-                    Ok(Some(ToSession::Init { version, device, width, height })) => {
+                    Ok(Some(ToSession::Init {
+                        version, device, width, height, size_rank, host_size_rank,
+                    })) => {
                         let reject = if version != PROTOCOL_VERSION {
                             Some(format!(
                                 "unsupported protocol version {version} \
@@ -305,8 +318,6 @@ async fn run(
                             ))
                         } else if width == 0 || height == 0 {
                             Some("invalid device dimensions".into())
-                        } else if viewer.is_some() {
-                            Some("another client is already connected".into())
                         } else {
                             None
                         };
@@ -318,10 +329,19 @@ async fn run(
                                 p.device = device;
                                 p.width = width;
                                 p.height = height;
+                                p.size_rank = size_rank.unwrap_or(0);
+                                if let Some(rank) = host_size_rank {
+                                    host_rank = rank;
+                                }
                                 p.state = ClientState::Ready;
-                                viewer = Some(p);
+                                let mut alive = true;
                                 if let Some(t) = mirror.title().map(str::to_string) {
-                                    send_title(&mut viewer, &t).await;
+                                    alive = p.send(&FromSession::Title { title: t })
+                                        .await
+                                        .is_ok();
+                                }
+                                if alive {
+                                    viewers.push(p);
                                 }
                             }
                         }
@@ -351,28 +371,27 @@ async fn run(
                 }
             }
 
-            // A message from the viewer.
-            msg = async { viewer.as_mut().unwrap().next_message().await },
-                    if viewer.is_some() => {
+            // A message from one of the viewers.
+            (i, msg) = next_from_any(&mut viewers), if !viewers.is_empty() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        let c = viewer.as_mut().unwrap();
                         if let Err(e) = handle_viewer_message(
-                            msg, c, &mut mirror, &mut pty_write, &mut stdout, readonly,
+                            msg, i, &mut viewers, &mut mirror, host_rank,
+                            &mut pty_write, &mut stdout, readonly,
                         )
                         .await
                         {
-                            let _ = c.send(&FromSession::Error {
+                            let _ = viewers[i].send(&FromSession::Error {
                                 message: format!("{e:#}"),
                             }).await;
-                            drop_viewer(&mut viewer, &mut mirror, &pty_write, &mut stdout).await?;
+                            viewers[i].dead = true;
                         }
                     }
                     // EOF or protocol garbage: drop the viewer.
-                    Ok(None) | Err(_) => {
-                        drop_viewer(&mut viewer, &mut mirror, &pty_write, &mut stdout).await?;
-                    }
+                    Ok(None) | Err(_) => viewers[i].dead = true,
                 }
+                sweep_and_refresh(&mut viewers, &mut mirror, host_rank, &pty_write, &mut stdout)
+                    .await?;
             }
 
             // Monitors don't speak after their first message; poll only to
@@ -386,14 +405,14 @@ async fn run(
 
             // Child exited: drain any final output, then finish.
             status = child.wait() => {
-                drain_pty(&mut pty_read, &mut mirror, &mut stdout, &mut viewer, &mut pty_buf)
+                drain_pty(&mut pty_read, &mut mirror, &mut stdout, &mut viewers, &mut pty_buf)
                     .await?;
                 break status?;
             }
         }
     };
 
-    if let Some(mut c) = viewer.take() {
+    for mut c in viewers.drain(..) {
         let _ = c
             .send(&FromSession::Exit {
                 status: status.code(),
@@ -404,6 +423,108 @@ async fn run(
     stdout.flush().await?;
     drop(control); // removes the socket file
     Ok(status)
+}
+
+/// Wait for the next message from any of `clients` (must be non-empty).
+/// Cancel-safe: each client's partially read input stays buffered in it.
+async fn next_from_any(clients: &mut [Client]) -> (usize, anyhow::Result<Option<ToSession>>) {
+    let futures = clients
+        .iter_mut()
+        .enumerate()
+        .map(|(i, c)| Box::pin(async move { (i, c.next_message().await) }));
+    futures_util::future::select_all(futures).await.0
+}
+
+/// Re-decide the view from the size-precedence ranks of everyone currently
+/// viewing (against the host terminal's own rank) and apply the outcome:
+/// start/restart the view at the winning dimensions, or end it when nobody
+/// views anymore. When the dimensions change, every viewing client gets a
+/// fresh snapshot (their streams restart at the new size); `force_for`
+/// additionally restarts at unchanged dimensions and snapshots just that
+/// client (used when it sent `view`, so it needs a snapshot in any case —
+/// the rebuilt stream stays seamless for the others because the model is
+/// re-primed with its own current state).
+///
+/// Send failures mark clients dead without removing them (callers may hold
+/// indices); `sweep_and_refresh` is the removal point.
+async fn refresh_view(
+    viewers: &mut [Client],
+    mirror: &mut Mirror,
+    host_rank: u32,
+    force_for: Option<usize>,
+    pty_write: &pty_process::OwnedWritePty,
+    stdout: &mut tokio::io::Stdout,
+) -> anyhow::Result<()> {
+    let best = viewers
+        .iter()
+        .filter(|c| !c.dead && c.state == ClientState::Viewing)
+        .min_by_key(|c| (c.size_rank, c.id));
+    let target = best.map(|c| {
+        if c.size_rank <= host_rank {
+            (c.height, c.width)
+        } else {
+            mirror.host_size()
+        }
+    });
+    match target {
+        None => {
+            // Nobody is viewing; a hotkey-simulated view is not ours to end.
+            if mirror.view().is_some_and(|v| !v.simulated) {
+                let t = mirror.end_view();
+                apply_transition(&t, pty_write, stdout).await?;
+            }
+        }
+        Some((rows, cols)) => {
+            let changed = mirror
+                .view()
+                .is_none_or(|v| v.simulated || (v.rows, v.cols) != (rows, cols));
+            if changed || force_for.is_some() {
+                let t = mirror.start_view(View {
+                    rows,
+                    cols,
+                    simulated: false,
+                });
+                apply_transition(&t, pty_write, stdout).await?;
+                let snapshot = FromSession::Snapshot {
+                    data: protocol::encode_terminal_bytes(&t.remote_output.unwrap_or_default()),
+                    width: cols,
+                    height: rows,
+                    // Everything archived so far (including rows just
+                    // flushed by the view-start crop) predates this
+                    // snapshot.
+                    history_next: mirror.history_extent().0,
+                };
+                for (i, c) in viewers
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(_, c)| !c.dead && c.state == ClientState::Viewing)
+                {
+                    if (changed || force_for == Some(i)) && c.send(&snapshot).await.is_err() {
+                        c.dead = true;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove dead clients and re-decide the view, repeating until no further
+/// client dies during the snapshot broadcasts.
+async fn sweep_and_refresh(
+    viewers: &mut Vec<Client>,
+    mirror: &mut Mirror,
+    host_rank: u32,
+    pty_write: &pty_process::OwnedWritePty,
+    stdout: &mut tokio::io::Stdout,
+) -> anyhow::Result<()> {
+    loop {
+        viewers.retain(|c| !c.dead);
+        refresh_view(viewers, mirror, host_rank, None, pty_write, stdout).await?;
+        if viewers.iter().all(|c| !c.dead) {
+            return Ok(());
+        }
+    }
 }
 
 /// Report a bell to the monitor connection, dropping it if the send fails.
@@ -430,24 +551,28 @@ async fn send_title(conn: &mut Option<Client>, title: &str) {
     }
 }
 
-/// Handle one message from the viewer (already past init). An error return
-/// drops the viewer.
+/// Handle one message from viewer `i` (already past init). An error return
+/// drops that viewer. May mark other viewers dead (snapshot broadcasts) but
+/// never removes entries, so `i` stays valid; the caller sweeps afterwards.
+#[allow(clippy::too_many_arguments)]
 async fn handle_viewer_message(
     msg: ToSession,
-    client: &mut Client,
+    i: usize,
+    viewers: &mut [Client],
     mirror: &mut Mirror,
+    host_rank: u32,
     pty_write: &mut pty_process::OwnedWritePty,
     stdout: &mut tokio::io::Stdout,
     readonly: bool,
 ) -> anyhow::Result<()> {
-    match (msg, client.state) {
+    match (msg, viewers[i].state) {
         (ToSession::Init { .. }, _) => anyhow::bail!("duplicate init"),
         (ToSession::Monitor { .. }, _) => anyhow::bail!("already initialized as a viewer"),
         (ToSession::Input { data }, _) => {
             if readonly {
                 // Reject without dropping the connection: a read-only
                 // session is a policy answer, not a protocol violation.
-                client
+                viewers[i]
                     .send(&FromSession::Error {
                         message: "session is read-only".into(),
                     })
@@ -460,23 +585,12 @@ async fn handle_viewer_message(
             Ok(())
         }
         (ToSession::View, _) => {
-            // Replaces any active view, including the simulated one and a
-            // re-sent view from the same client (which just re-snapshots).
-            let t = mirror.start_view(View {
-                rows: client.height,
-                cols: client.width,
-                simulated: false,
-            });
-            apply_transition(&t, pty_write, stdout).await?;
-            let snapshot = FromSession::Snapshot {
-                data: protocol::encode_terminal_bytes(&t.remote_output.unwrap_or_default()),
-                // Everything archived so far (including rows just flushed
-                // by the view-start crop) predates this snapshot.
-                history_next: mirror.history_extent().0,
-            };
-            client.send(&snapshot).await?;
-            client.state = ClientState::Viewing;
-            Ok(())
+            // The refresh restarts the view unconditionally, so this client
+            // gets its snapshot even when the winning dimensions are
+            // unchanged (and a re-sent view still re-snapshots); the other
+            // viewers are re-snapshotted only if the dimensions changed.
+            viewers[i].state = ClientState::Viewing;
+            refresh_view(viewers, mirror, host_rank, Some(i), pty_write, stdout).await
         }
         (ToSession::History { before, limit }, _) => {
             let limit = limit
@@ -492,7 +606,7 @@ async fn handle_viewer_message(
                     wrapped: r.wrapped,
                 })
                 .collect();
-            client
+            viewers[i]
                 .send(&FromSession::HistoryLines {
                     start,
                     oldest,
@@ -503,17 +617,15 @@ async fn handle_viewer_message(
             Ok(())
         }
         (ToSession::Unview, ClientState::Viewing) => {
-            let t = mirror.end_view();
-            apply_transition(&t, pty_write, stdout).await?;
-            client.state = ClientState::Ready;
-            Ok(())
+            viewers[i].state = ClientState::Ready;
+            refresh_view(viewers, mirror, host_rank, None, pty_write, stdout).await
         }
         (ToSession::Unview, _) => Ok(()), // idempotent
     }
 }
 
 /// Ctrl+G: toggle the simulated device view. Ignored while a real client is
-/// viewing.
+/// viewing (a real view exists exactly when a non-simulated view is active).
 async fn toggle_simulated(
     mirror: &mut Mirror,
     pty_write: &pty_process::OwnedWritePty,
@@ -529,23 +641,6 @@ async fn toggle_simulated(
         Some(_) => return Ok(()),
     };
     apply_transition(&t, pty_write, stdout).await
-}
-
-/// Disconnect the viewer, ending its view if it had one.
-async fn drop_viewer(
-    client: &mut Option<Client>,
-    mirror: &mut Mirror,
-    pty_write: &pty_process::OwnedWritePty,
-    stdout: &mut tokio::io::Stdout,
-) -> anyhow::Result<()> {
-    let was_viewing = client
-        .take()
-        .is_some_and(|c| c.state == ClientState::Viewing);
-    if was_viewing {
-        let t = mirror.end_view();
-        apply_transition(&t, pty_write, stdout).await?;
-    }
-    Ok(())
 }
 
 async fn apply_transition(
@@ -564,12 +659,12 @@ async fn apply_transition(
 }
 
 /// After the child exits, read whatever it wrote just before exiting,
-/// delivering it to the host terminal and (best-effort) a viewing client.
+/// delivering it to the host terminal and (best-effort) the viewing clients.
 async fn drain_pty(
     pty_read: &mut pty_process::OwnedReadPty,
     mirror: &mut Mirror,
     stdout: &mut tokio::io::Stdout,
-    client: &mut Option<Client>,
+    viewers: &mut Vec<Client>,
     buf: &mut [u8],
 ) -> anyhow::Result<()> {
     let deadline = std::time::Duration::from_millis(50);
@@ -579,14 +674,17 @@ async fn drain_pty(
         }
         let out = mirror.process(&buf[..n]);
         stdout.write_all(&out.host).await?;
-        if let (Some(data), Some(c)) = (out.remote, client.as_mut())
-            && c.state == ClientState::Viewing && !data.is_empty() {
+        if let Some(data) = out.remote
+            && !data.is_empty() {
                 let msg = FromSession::Output {
                     data: protocol::encode_terminal_bytes(&data),
                 };
-                if c.send(&msg).await.is_err() {
-                    *client = None;
+                for c in viewers.iter_mut().filter(|c| c.state == ClientState::Viewing) {
+                    if c.send(&msg).await.is_err() {
+                        c.dead = true;
+                    }
                 }
+                viewers.retain(|c| !c.dead);
             }
     }
     stdout.flush().await?;

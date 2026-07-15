@@ -190,6 +190,11 @@ impl Mirror {
         self.view
     }
 
+    /// The host terminal's current dimensions, as (rows, cols).
+    pub fn host_size(&self) -> (u16, u16) {
+        (self.host_rows, self.host_cols)
+    }
+
     /// Current window title, as last set by the app.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()

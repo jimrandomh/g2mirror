@@ -27,6 +27,16 @@ pub enum ToSession {
         /// Device terminal size in character cells.
         width: u16,
         height: u16,
+        /// Size-precedence rank of this viewer (lower wins), computed by
+        /// g2mirror-server from the `size_precedence` config list. When
+        /// several clients view at once, the wrapped app is sized to the
+        /// best-ranked one. Absent (direct connections): rank 0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_rank: Option<u32>,
+        /// Rank of the host terminal in the same ordering. Absent: the
+        /// host ranks below every viewer (the pre-precedence behavior).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_size_rank: Option<u32>,
     },
     /// Alternative first message: this connection is a monitor (normally
     /// g2mirror-server). It receives bell notifications and does not count
@@ -70,12 +80,21 @@ pub enum FromSession {
         /// Extent of the scrollback history archive.
         history: HistoryExtent,
     },
-    /// Full repaint of the device screen; sent on view. `data` is base64 of
-    /// terminal bytes (escape sequences) to feed a fresh emulator of the
-    /// device's declared width/height. Every history line with index <
-    /// `history_next` is fetchable; lines the client witnesses scrolling
-    /// off its emulator after this snapshot continue from that index.
-    Snapshot { data: String, history_next: u64 },
+    /// Full repaint of the mirrored screen; sent on view, and re-sent to
+    /// every viewing client whenever the stream's dimensions change (a
+    /// better-ranked viewer attached or detached). `data` is base64 of
+    /// terminal bytes (escape sequences) to feed a fresh emulator of
+    /// exactly `width` x `height` cells — which is the size of the
+    /// best-ranked viewer, not necessarily yours. Every history line with
+    /// index < `history_next` is fetchable; lines the client witnesses
+    /// scrolling off its emulator after this snapshot continue from that
+    /// index.
+    Snapshot {
+        data: String,
+        width: u16,
+        height: u16,
+        history_next: u64,
+    },
     /// Incremental terminal output while viewing; base64, same encoding.
     Output { data: String },
     /// Sent to monitor connections when the app rings the terminal bell.

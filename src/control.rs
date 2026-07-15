@@ -1,6 +1,7 @@
-//! The wrapper's session socket: a unix domain socket in ~/.g2mirror that a
-//! client (normally g2mirror-server) connects to, speaking newline-delimited
-//! JSON. One client at a time.
+//! The wrapper's session socket: a unix domain socket in ~/.g2mirror that
+//! clients (normally g2mirror-server, relaying for devices) connect to,
+//! speaking newline-delimited JSON. Several viewers may be connected — and
+//! viewing — at once; the wrapped app is sized to the best-ranked one.
 
 use std::path::PathBuf;
 
@@ -111,10 +112,17 @@ pub struct Client {
     pub device: String,
     pub width: u16,
     pub height: u16,
+    /// Size-precedence rank from the init message (lower wins the size).
+    pub size_rank: u32,
+    /// Arrival order, the tie-break between equally ranked viewers.
+    pub id: u64,
+    /// Marked when a send fails; swept out of the viewer list at safe
+    /// points (mid-iteration removal would invalidate indices).
+    pub dead: bool,
 }
 
 impl Client {
-    pub fn new(stream: UnixStream) -> Self {
+    pub fn new(stream: UnixStream, id: u64) -> Self {
         Self {
             stream,
             buf: Vec::new(),
@@ -122,6 +130,9 @@ impl Client {
             device: String::new(),
             width: 0,
             height: 0,
+            size_rank: 0,
+            id,
+            dead: false,
         }
     }
 
