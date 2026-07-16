@@ -26,9 +26,14 @@ version: **1**.
   mirrors a session into a regular terminal); it speaks exactly the
   protocol described here.
 
-Transport security is deliberately out of scope: the server listens on the
-address in `~/.g2mirror/config.json` (loopback by default) and is intended to
-be reached over tailscale or an ssh tunnel. Run `g2mirror-server
+Transport security is deliberately out of the server's scope: it listens
+on the address(es) in `~/.g2mirror/config.json` (loopback by default) and
+is intended to be reached over tailscale, an ssh tunnel, or — for viewers
+outside the tailnet — a `tailscale funnel` HTTPS endpoint that proxies to
+a loopback listener (drivers then connect with `wss://`). The server sends
+a websocket **ping** frame every 30 seconds as a keepalive; reply with
+pongs (websocket libraries do this automatically). Unauthenticated
+connections are dropped after 10 seconds and capped at 32 concurrent. Run `g2mirror-server
 --init-config` once to generate the config and its first auth token, and
 `g2mirror-server --add-token <name> [--writable]` for additional viewers
 (tokens are printed once; only SHA-256 hashes are stored). Each token has a

@@ -97,6 +97,37 @@ cargo build
 ./target/debug/g2mirror-view "g2mirror://<token>@127.0.0.1:8737"
 ```
 
+## Exposing to coworkers with tailscale funnel
+
+For viewers outside your tailnet, terminate TLS with [tailscale
+funnel](https://tailscale.com/kb/1223/funnel) instead of building it into
+the server. Add loopback to `listen_addr` (it takes a string or an array):
+
+```json
+"listen_addr": ["127.0.0.1", "100.68.94.67"]
+```
+
+then `tailscale funnel --bg 8737`. Direct tailnet clients (the glasses)
+keep using the tailscale address; funnel proxies public
+`wss://<node>.<tailnet>.ts.net` traffic — websocket upgrades pass through
+its HTTPS proxy — to the loopback listener. A coworker then needs nothing
+installed beyond g2mirror-view:
+
+```sh
+g2mirror-view "g2mirrors://<token>@<node>.<tailnet>.ts.net"
+```
+
+(`g2mirrors://` is the TLS form, default port 443.) Treat the funnel
+hostname as public knowledge — TLS certificates land in Certificate
+Transparency logs — so security rests on the tokens: keep coworker tokens
+read-only and filtered. The server hardens the public surface by capping
+concurrent unauthenticated connections (32), enforcing a 10s
+handshake+auth deadline, logging failed authentications with the peer
+address, and sending websocket keepalive pings every 30s so idle
+connections survive the proxy path. If funnel's HTTP proxy ever misbehaves
+for websockets, its TLS-terminated-TCP mode forwards the raw byte stream
+and works identically.
+
 `--title` sets the initial window title (shown in session lists and pushed
 to devices) for programs that never set one themselves; a program-set title
 takes over from there. Lines that scroll off screen (including before any

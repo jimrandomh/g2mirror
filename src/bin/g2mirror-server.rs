@@ -23,6 +23,17 @@ use tokio_tungstenite::WebSocketStream;
 /// How often to scan ~/.g2mirror for new session sockets to monitor.
 const MONITOR_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// A connection must complete the websocket handshake and authenticate
+/// within this long, so half-open connections to a public (e.g. tailscale
+/// funnel) endpoint can't linger.
+const AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Cap on connections that have not authenticated yet, across all
+/// listeners. Authenticated device connections are not counted.
+const MAX_UNAUTHENTICATED: usize = 32;
+/// Idle keepalive: websocket pings at this interval stop NAT/proxy
+/// middleboxes (e.g. on the funnel path) from reaping quiet connections.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Per-terminal state learned through the monitor connections.
 #[derive(Default, Clone)]
 struct TerminalState {
@@ -160,11 +171,33 @@ fn session_allowed(rules: &[CompiledRule], state: &BellState, socket: &str) -> b
     filter_allows(rules, terminal.cwd.as_deref(), terminal.title.as_deref())
 }
 
+/// One listen address or several (e.g. loopback for a tailscale funnel
+/// proxy plus the tailscale IP for direct tailnet clients).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum ListenAddrs {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ListenAddrs {
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        match self {
+            ListenAddrs::One(addr) => std::slice::from_ref(addr),
+            ListenAddrs::Many(addrs) => addrs.as_slice(),
+        }
+        .iter()
+        .map(String::as_str)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Config {
-    /// Address to listen on. The server trusts this to be non-public
-    /// (loopback or a tailscale address); it warns on 0.0.0.0/::.
-    listen_addr: String,
+    /// Address(es) to listen on: a string or an array of strings. The
+    /// server trusts these to be non-public (loopback or a tailscale
+    /// address — public reachability is tailscale funnel's job); it warns
+    /// on 0.0.0.0/::.
+    listen_addr: ListenAddrs,
     port: u16,
     /// Tokens accepted for authentication. Manage with `--add-token`.
     #[serde(default)]
@@ -255,7 +288,7 @@ fn init_config() -> anyhow::Result<()> {
     );
     let token = generate_token()?;
     let config = Config {
-        listen_addr: "127.0.0.1".into(),
+        listen_addr: ListenAddrs::One("127.0.0.1".into()),
         port: 8737,
         auth_tokens: vec![TokenConfig {
             name: "glasses".into(),
@@ -360,44 +393,115 @@ fn serve() -> anyhow::Result<()> {
         eprintln!("removed stale session socket {}", path.display());
     }
 
-    if let Ok(addr) = config.listen_addr.parse::<std::net::IpAddr>()
-        && addr.is_unspecified() {
+    for addr in config.listen_addr.iter() {
+        if let Ok(addr) = addr.parse::<std::net::IpAddr>()
+            && addr.is_unspecified()
+        {
             eprintln!(
                 "warning: listening on {} exposes the server on all interfaces; \
                  prefer a loopback or tailscale address",
                 addr
             );
         }
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind((config.listen_addr.as_str(), config.port))
-            .await
-            .with_context(|| {
-                format!("failed to bind {}:{}", config.listen_addr, config.port)
-            })?;
-        // Parsed by tooling; keep the format stable.
-        println!("g2mirror-server listening on {}", listener.local_addr()?);
+        let mut listeners = Vec::new();
+        for addr in config.listen_addr.iter() {
+            let listener = tokio::net::TcpListener::bind((addr, config.port))
+                .await
+                .with_context(|| format!("failed to bind {}:{}", addr, config.port))?;
+            // Parsed by tooling; keep the format stable.
+            println!("g2mirror-server listening on {}", listener.local_addr()?);
+            listeners.push(listener);
+        }
         let config = Arc::new(config);
         let dir = Arc::new(dir);
         let filters = Arc::new(filters);
         let state = BellState::new();
-        tokio::spawn(monitor_manager((*dir).clone(), state.clone()));
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            let config = config.clone();
-            let dir = dir.clone();
-            let filters = filters.clone();
-            let state = state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_device(stream, &config, &filters, &dir, &state).await {
-                    eprintln!("connection from {peer}: {e:#}");
-                }
-            });
+        let unauth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for listener in listeners {
+            tokio::spawn(accept_loop(
+                listener,
+                config.clone(),
+                filters.clone(),
+                dir.clone(),
+                state.clone(),
+                unauth.clone(),
+            ));
         }
+        monitor_manager((*dir).clone(), state.clone()).await;
+        Ok(())
     })
+}
+
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    config: Arc<Config>,
+    filters: Arc<HashMap<String, Vec<CompiledRule>>>,
+    dir: Arc<PathBuf>,
+    state: Arc<BellState>,
+    unauth: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // Transient (e.g. fd exhaustion): back off and keep serving.
+                eprintln!("accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        // Cap connections that haven't authenticated yet, so junk traffic
+        // to a public endpoint can't accumulate half-open handshakes.
+        let Some(guard) = UnauthGuard::acquire(&unauth) else {
+            eprintln!("connection from {peer}: dropped (too many unauthenticated connections)");
+            continue;
+        };
+        let config = config.clone();
+        let filters = filters.clone();
+        let dir = dir.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_device(stream, guard, &config, &filters, &dir, &state).await {
+                eprintln!("connection from {peer}: {e:#}");
+            }
+        });
+    }
+}
+
+/// RAII slot in the unauthenticated-connection budget.
+struct UnauthGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl UnauthGuard {
+    fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_UNAUTHENTICATED {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self(counter.clone())),
+                Err(now) => current = now,
+            }
+        }
+    }
+}
+
+impl Drop for UnauthGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Keep a monitor connection open to every live session socket so bells are
@@ -485,13 +589,13 @@ async fn run_monitor(path: &Path, name: &str, state: &BellState) -> anyhow::Resu
     Ok(())
 }
 
-async fn handle_device(
+/// Websocket handshake plus the authenticating init exchange. Returns None
+/// on a clean pre-auth close; a rejected connection is an error so the
+/// caller logs it with the peer address.
+async fn authenticate_device(
     stream: TcpStream,
     config: &Config,
-    filters: &HashMap<String, Vec<CompiledRule>>,
-    dir: &Path,
-    state: &BellState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<(WebSocketStream<TcpStream>, DeviceInit, TokenConfig)>> {
     let mut ws = tokio_tungstenite::accept_async(stream)
         .await
         .context("websocket handshake failed")?;
@@ -499,7 +603,7 @@ async fn handle_device(
     // First message must be init with a valid auth token.
     let init: DeviceInit = match next_text(&mut ws).await? {
         Some(text) => serde_json::from_str(&text).context("first message must be init")?,
-        None => return Ok(()),
+        None => return Ok(None),
     };
     let token = config
         .tokens()
@@ -509,15 +613,15 @@ async fn handle_device(
         Some(token) if init.msg_type == "init" && init.version == PROTOCOL_VERSION => token,
         _ => {
             let message = if init.msg_type != "init" {
-                "first message must be init".into()
+                "first message must be init".to_string()
             } else if init.version != PROTOCOL_VERSION {
                 format!("unsupported protocol version {}", init.version)
             } else {
-                "authentication failed".into()
+                "authentication failed".to_string()
             };
-            send(&mut ws, &ServerToDevice::Error { message }).await?;
+            send(&mut ws, &ServerToDevice::Error { message: message.clone() }).await?;
             ws.close(None).await?;
-            return Ok(());
+            anyhow::bail!("{message}");
         }
     };
     send(
@@ -528,10 +632,30 @@ async fn handle_device(
         },
     )
     .await?;
+    Ok(Some((ws, init, token)))
+}
+
+async fn handle_device(
+    stream: TcpStream,
+    unauth_guard: UnauthGuard,
+    config: &Config,
+    filters: &HashMap<String, Vec<CompiledRule>>,
+    dir: &Path,
+    state: &BellState,
+) -> anyhow::Result<()> {
+    let (mut ws, init, token) =
+        match tokio::time::timeout(AUTH_DEADLINE, authenticate_device(stream, config)).await {
+            Ok(Ok(Some(authenticated))) => authenticated,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!("authentication deadline expired"),
+        };
+    drop(unauth_guard); // authenticated: release the pre-auth budget slot
     let filter = filters.get(&token.name).map(Vec::as_slice).unwrap_or(&[]);
 
     let mut session: Option<SessionConn> = None;
     let mut event_rx = state.event_tx.subscribe();
+    let mut ping = tokio::time::interval(PING_INTERVAL);
     loop {
         tokio::select! {
             msg = ws.next() => {
@@ -580,6 +704,12 @@ async fn handle_device(
                     }
                 }
                 // Lagged receivers just miss old events; `list` resyncs.
+            }
+            // Keepalive so NAT/proxy middleboxes (e.g. on a tailscale
+            // funnel path) don't reap idle connections. Clients' websocket
+            // libraries answer pings automatically.
+            _ = ping.tick() => {
+                ws.send(Message::Ping(Vec::new().into())).await?;
             }
         }
     }

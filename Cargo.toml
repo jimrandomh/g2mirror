@@ -10,10 +10,11 @@ futures-util = "0.3.32"
 getrandom = "0.4.3"
 pty-process = { version = "0.5.3", features = ["async"] }
 regex = "1.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustix = { version = "1.1.4", features = ["termios", "stdio", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 tokio = { version = "1.52.3", features = ["rt", "macros", "io-std", "io-util", "signal", "process", "net", "time", "sync"] }
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
 vt100 = "0.16.2"

@@ -476,6 +476,73 @@ async fn filtered_token_restricts_list_connect_and_events() {
     server.kill().await.ok();
 }
 
+#[tokio::test]
+async fn multiple_listen_addresses_keepalive_and_unauth_cap() {
+    let dir = test_dir("multilisten");
+    std::fs::write(
+        dir.join("config.json"),
+        json!({
+            // Two listeners (distinct ephemeral ports), as one would run
+            // for a tailscale-funnel proxy plus direct tailnet clients.
+            "listen_addr": ["127.0.0.1", "127.0.0.1"], "port": 0,
+            "auth_tokens": [{"name": "t", "token_hash": sha256_hex("tok"), "readonly": false}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut server = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror-server"))
+        .env("G2MIRROR_DIR", &dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut server_out = BufReader::new(server.stdout.take().unwrap());
+    let mut addrs = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), server_out.read_line(&mut line))
+            .await
+            .expect("server did not print both listen addresses")
+            .unwrap();
+        addrs.push(line.trim().rsplit(' ').next().unwrap().to_string());
+    }
+    assert_ne!(addrs[0], addrs[1], "ephemeral ports must differ");
+
+    // Both listeners authenticate; the first keepalive ping arrives
+    // promptly after the handshake.
+    for addr in &addrs {
+        let (mut ws, reply) = connect_device(addr, "tok").await;
+        assert_eq!(reply["type"], "init", "listener {addr} must serve");
+        let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("no keepalive ping")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(frame, Message::Ping(_)), "expected ping, got {frame:?}");
+    }
+
+    // Fill the unauthenticated-connection budget with idle TCP
+    // connections that never start the websocket handshake...
+    let mut idle = Vec::new();
+    for _ in 0..32 {
+        idle.push(tokio::net::TcpStream::connect(&addrs[0]).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // ...and the next connection is dropped immediately (EOF), well before
+    // the 10s auth deadline frees the budget.
+    let mut extra = tokio::net::TcpStream::connect(&addrs[1]).await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(3), tokio::io::AsyncReadExt::read(&mut extra, &mut buf))
+        .await
+        .expect("over-budget connection was not dropped")
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF on the over-budget connection");
+    drop(idle);
+
+    server.kill().await.ok();
+}
+
 /// Extract the printed one-time token (a 64-char hex line) from command
 /// output.
 fn printed_token(output: &std::process::Output) -> String {

@@ -35,17 +35,24 @@ const SGR_RESET: &[u8] = b"\x1b[0m";
 
 fn usage() -> ! {
     eprintln!("usage: g2mirror-view g2mirror://<token>@<host>[:<port>]");
+    eprintln!("       g2mirror-view g2mirrors://<token>@<host>[:<port>]");
     eprintln!("  the token comes from g2mirror-server --init-config / --add-token");
-    eprintln!("  default port: {DEFAULT_PORT}");
+    eprintln!("  g2mirror://  — plain websocket (private network), default port {DEFAULT_PORT}");
+    eprintln!("  g2mirrors:// — TLS (e.g. a tailscale funnel hostname), default port 443");
     std::process::exit(2);
 }
 
-/// Split a `g2mirror://<token>@<host>[:<port>]` connection string into the
-/// token and a dialable `host:port`.
+/// Split a `g2mirror[s]://<token>@<host>[:<port>]` connection string into
+/// the token and a dialable websocket URL (`g2mirrors` means TLS, for
+/// endpoints like a tailscale funnel hostname).
 fn parse_connection_string(s: &str) -> anyhow::Result<(String, String)> {
-    let rest = s
-        .strip_prefix("g2mirror://")
-        .context("connection string must start with g2mirror://")?;
+    let (scheme, rest, default_port) = if let Some(rest) = s.strip_prefix("g2mirrors://") {
+        ("wss", rest, 443)
+    } else if let Some(rest) = s.strip_prefix("g2mirror://") {
+        ("ws", rest, DEFAULT_PORT)
+    } else {
+        anyhow::bail!("connection string must start with g2mirror:// or g2mirrors://");
+    };
     let (token, host) = rest
         .rsplit_once('@')
         .context("connection string must contain <token>@<host>")?;
@@ -55,15 +62,18 @@ fn parse_connection_string(s: &str) -> anyhow::Result<(String, String)> {
     // its last colon-suffix still contains the closing bracket).
     let addr = match host.rfind(':') {
         Some(i) if !host[i..].contains(']') => host.to_string(),
-        _ => format!("{host}:{DEFAULT_PORT}"),
+        _ => format!("{host}:{default_port}"),
     };
-    Ok((token.to_string(), addr))
+    Ok((token.to_string(), format!("{scheme}://{addr}")))
 }
 
 fn host_size() -> (u16, u16) {
-    rustix::termios::tcgetwinsize(rustix::stdio::stdout())
-        .map(|ws| (ws.ws_row, ws.ws_col))
-        .unwrap_or((24, 80))
+    // A pty can report 0x0 (e.g. under `script` without a real terminal);
+    // fall back rather than declaring degenerate dimensions.
+    match rustix::termios::tcgetwinsize(rustix::stdio::stdout()) {
+        Ok(ws) if ws.ws_row > 0 && ws.ws_col > 0 => (ws.ws_row, ws.ws_col),
+        _ => (24, 80),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -85,7 +95,7 @@ fn main() {
     if conn == "--help" || conn == "-h" {
         usage();
     }
-    let (token, addr) = match parse_connection_string(&conn) {
+    let (token, url) = match parse_connection_string(&conn) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("g2mirror-view: {e:#}");
@@ -96,11 +106,15 @@ fn main() {
         eprintln!("g2mirror-view: stdin is not a terminal");
         std::process::exit(1);
     }
+    // rustls ships without a process-level crypto provider compiled in;
+    // select one explicitly or wss:// connections panic at handshake time.
+    // (Err just means one is already installed.)
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    if let Err(e) = runtime.block_on(run(token, addr)) {
+    if let Err(e) = runtime.block_on(run(token, url)) {
         eprintln!("g2mirror-view: {e:#}");
         std::process::exit(1);
     }
@@ -151,10 +165,10 @@ struct App {
     quit: bool,
 }
 
-async fn run(token: String, addr: String) -> anyhow::Result<()> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+async fn run(token: String, url: String) -> anyhow::Result<()> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
-        .with_context(|| format!("failed to connect to {addr}"))?;
+        .with_context(|| format!("failed to connect to {url}"))?;
 
     let (rows, cols) = host_size();
     send_json(
@@ -185,7 +199,7 @@ async fn run(token: String, addr: String) -> anyhow::Result<()> {
     let _raw = RawGuard::new().context("failed to enter raw mode")?;
     let mut app = App {
         stdout: tokio::io::stdout(),
-        addr,
+        addr: url,
         rows,
         cols,
         init_rows: rows,
@@ -773,19 +787,28 @@ mod tests {
     fn connection_strings_parse() {
         assert_eq!(
             parse_connection_string("g2mirror://tok123@example.com:9000").unwrap(),
-            ("tok123".into(), "example.com:9000".into())
+            ("tok123".into(), "ws://example.com:9000".into())
         );
         assert_eq!(
             parse_connection_string("g2mirror://tok@example.com").unwrap(),
-            ("tok".into(), format!("example.com:{DEFAULT_PORT}"))
+            ("tok".into(), format!("ws://example.com:{DEFAULT_PORT}"))
         );
         assert_eq!(
             parse_connection_string("g2mirror://tok@[::1]").unwrap(),
-            ("tok".into(), format!("[::1]:{DEFAULT_PORT}"))
+            ("tok".into(), format!("ws://[::1]:{DEFAULT_PORT}"))
         );
         assert_eq!(
             parse_connection_string("g2mirror://tok@[::1]:9000").unwrap(),
-            ("tok".into(), "[::1]:9000".into())
+            ("tok".into(), "ws://[::1]:9000".into())
+        );
+        // The TLS form, e.g. for a tailscale funnel hostname.
+        assert_eq!(
+            parse_connection_string("g2mirrors://tok@node.tail.ts.net").unwrap(),
+            ("tok".into(), "wss://node.tail.ts.net:443".into())
+        );
+        assert_eq!(
+            parse_connection_string("g2mirrors://tok@node.tail.ts.net:8443").unwrap(),
+            ("tok".into(), "wss://node.tail.ts.net:8443".into())
         );
         assert!(parse_connection_string("ws://tok@host").is_err());
         assert!(parse_connection_string("g2mirror://hostonly").is_err());

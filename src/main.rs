@@ -107,9 +107,12 @@ fn exit_code(status: ExitStatus) -> i32 {
 }
 
 fn host_size() -> (u16, u16) {
-    rustix::termios::tcgetwinsize(rustix::stdio::stdout())
-        .map(|ws| (ws.ws_row, ws.ws_col))
-        .unwrap_or((24, 80))
+    // A pty can report 0x0 (e.g. under `script` without a real terminal);
+    // fall back rather than running the mirror at degenerate dimensions.
+    match rustix::termios::tcgetwinsize(rustix::stdio::stdout()) {
+        Ok(ws) if ws.ws_row > 0 && ws.ws_col > 0 => (ws.ws_row, ws.ws_col),
+        _ => (24, 80),
+    }
 }
 
 async fn run(
