@@ -54,7 +54,18 @@ pub enum ToSession {
     /// mirrored in the output stream, e.g. bracketed paste). Rejected with
     /// an `error` message — without closing the connection — when the
     /// session is read-only.
-    Input { data: String },
+    Input {
+        data: String,
+        /// Pauses the wrapper inserts while writing the decoded bytes, so
+        /// apps that infer pasting from bytes arriving together (and would
+        /// e.g. treat a trailing newline as a pasted soft newline rather
+        /// than a submit) see distinct keystrokes. Wrapper-side timing is
+        /// immune to network jitter, unlike a client sleeping between two
+        /// `input` messages. Offsets must be non-decreasing; the wrapper
+        /// caps each pause and the entry count (see PROTOCOL.md).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delays: Vec<InputDelay>,
+    },
     /// Request scrollback history: up to `limit` lines (default 500,
     /// additionally capped by a reply byte budget) ending just before line
     /// index `before`. Paginate backwards by passing the previous reply's
@@ -116,6 +127,17 @@ pub enum FromSession {
         lines: Vec<HistoryLine>,
     },
     Error { message: String },
+}
+
+/// A pause inside an `input` message: after writing the first `at` bytes of
+/// the decoded data, the wrapper waits `ms` milliseconds before writing the
+/// rest. `at` == data length pauses after everything, holding back any
+/// subsequently queued input.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct InputDelay {
+    /// Byte offset into the decoded `data` (not a character index).
+    pub at: u64,
+    pub ms: u64,
 }
 
 /// Extent of the history archive: line indices `oldest..next` are fetchable.

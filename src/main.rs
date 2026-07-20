@@ -32,6 +32,64 @@ const REFRESH_KEY: u8 = 0x0c;
 /// Bell notifications are debounced to at most one per this window.
 const BELL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Caps on client-requested input delays: each pause is clamped to this
+/// many milliseconds, and a single `input` message may carry at most this
+/// many delay entries.
+const MAX_INPUT_DELAY_MS: u64 = 1000;
+const MAX_INPUT_DELAYS: usize = 32;
+
+/// Input bytes waiting on a client-requested pause (the `input` message's
+/// `delays` field). Chunks are written to the pty from the main loop when
+/// their pause elapses, so a pause never stalls output mirroring; while the
+/// queue is non-empty all further input is appended behind it, keeping
+/// bytes in the order the client sent them.
+#[derive(Default)]
+struct InputQueue {
+    /// (pause before writing, bytes to write).
+    queue: std::collections::VecDeque<(std::time::Duration, Vec<u8>)>,
+    /// When the head chunk may be written; set by `pump` when it starts the
+    /// head's pause, so it is `Some` whenever a pause is actually running.
+    due: Option<tokio::time::Instant>,
+}
+
+impl InputQueue {
+    /// Split `bytes` at the delay offsets (validated by the caller as
+    /// non-decreasing and within bounds) and append the chunks.
+    fn push(&mut self, bytes: Vec<u8>, delays: &[protocol::InputDelay]) {
+        let mut prev = 0usize;
+        let mut pause = std::time::Duration::ZERO;
+        for d in delays {
+            let at = usize::try_from(d.at).unwrap_or(bytes.len());
+            self.queue.push_back((pause, bytes[prev..at].to_vec()));
+            pause = std::time::Duration::from_millis(d.ms.min(MAX_INPUT_DELAY_MS));
+            prev = at;
+        }
+        self.queue.push_back((pause, bytes[prev..].to_vec()));
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.due
+    }
+
+    /// Write every chunk whose pause has elapsed, then start the next
+    /// pending pause (if any) and record its deadline.
+    async fn pump(&mut self, pty_write: &mut pty_process::OwnedWritePty) -> anyhow::Result<()> {
+        while let Some((pause, _)) = self.queue.front() {
+            let now = tokio::time::Instant::now();
+            let due = *self.due.get_or_insert(now + *pause);
+            if due > now {
+                return Ok(());
+            }
+            let (_, bytes) = self.queue.pop_front().unwrap();
+            self.due = None;
+            if !bytes.is_empty() {
+                pty_write.write_all(&bytes).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -199,6 +257,7 @@ async fn run(
     let mut host_rank: u32 = u32::MAX;
     let mut next_client_id: u64 = 0;
     let mut bell = BellDebouncer::new(BELL_DEBOUNCE);
+    let mut input_queue = InputQueue::default();
     let mut stdin_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 64 * 1024];
     let mut stdin_open = true;
@@ -285,6 +344,13 @@ async fn run(
                 if let Some(at) = bell.fire(std::time::Instant::now()) {
                     send_bell(&mut monitor, at).await;
                 }
+            }
+
+            // A queued input chunk's client-requested pause has elapsed.
+            _ = async {
+                tokio::time::sleep_until(input_queue.deadline().unwrap()).await
+            }, if input_queue.deadline().is_some() => {
+                input_queue.pump(&mut pty_write).await?;
             }
 
             // Host terminal resized.
@@ -395,7 +461,7 @@ async fn run(
                     Ok(Some(msg)) => {
                         if let Err(e) = handle_viewer_message(
                             msg, i, &mut viewers, &mut mirror, host_rank,
-                            &mut pty_write, &mut stdout, readonly,
+                            &mut pty_write, &mut stdout, readonly, &mut input_queue,
                         )
                         .await
                         {
@@ -582,11 +648,12 @@ async fn handle_viewer_message(
     pty_write: &mut pty_process::OwnedWritePty,
     stdout: &mut tokio::io::Stdout,
     readonly: bool,
+    input_queue: &mut InputQueue,
 ) -> anyhow::Result<()> {
     match (msg, viewers[i].state) {
         (ToSession::Init { .. }, _) => anyhow::bail!("duplicate init"),
         (ToSession::Monitor { .. }, _) => anyhow::bail!("already initialized as a viewer"),
-        (ToSession::Input { data }, _) => {
+        (ToSession::Input { data, delays }, _) => {
             if readonly {
                 // Reject without dropping the connection: a read-only
                 // session is a policy answer, not a protocol violation.
@@ -599,7 +666,20 @@ async fn handle_viewer_message(
             }
             let bytes = protocol::decode_terminal_bytes(&data)
                 .map_err(|e| anyhow::anyhow!("invalid input encoding: {e}"))?;
-            pty_write.write_all(&bytes).await?;
+            anyhow::ensure!(
+                delays.len() <= MAX_INPUT_DELAYS,
+                "too many input delays (max {MAX_INPUT_DELAYS})"
+            );
+            let mut prev = 0u64;
+            for d in &delays {
+                anyhow::ensure!(
+                    d.at >= prev && d.at <= bytes.len() as u64,
+                    "input delay offsets must be non-decreasing and within the data"
+                );
+                prev = d.at;
+            }
+            input_queue.push(bytes, &delays);
+            input_queue.pump(pty_write).await?;
             Ok(())
         }
         (ToSession::View, _) => {

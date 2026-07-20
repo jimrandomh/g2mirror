@@ -307,6 +307,37 @@ whether or not you are currently viewing. If the session or the server is
 read-only, the rejecting side replies with an `error` message but keeps the
 connection open.
 
+An optional `delays` field makes the wrapper pause partway through writing
+the bytes:
+
+```json
+{"type": "input", "data": "<base64 of 'ship it\r'>",
+ "delays": [{"at": 7, "ms": 150}]}
+```
+
+Each entry means: after writing the first `at` bytes of the decoded data
+(a byte offset, not a character index), wait `ms` milliseconds before
+continuing. Use this when the wrapped app infers pasting from bytes
+arriving in one read — some apps (e.g. Claude Code) treat text followed
+immediately by a newline as a paste and turn the newline into a soft
+line break instead of a submit. A pause before the trailing `\r` makes
+it read as a separate Enter keypress. The pause happens wrapper-side, on
+the machine running the app, so it works regardless of network timing —
+unlike the client sleeping between two `input` messages.
+
+Rules:
+
+- Offsets must be non-decreasing and at most the decoded length; at most
+  32 delays per message. Violations are protocol errors (the connection
+  is dropped). `at` equal to the length pauses after everything, delaying
+  any input that arrives later.
+- Each `ms` is clamped to 1000.
+- A pending pause never blocks the session: output keeps streaming, and
+  other messages are handled normally. Further `input` (from any client)
+  queues behind the pending bytes, preserving order.
+- Wrappers older than the field ignore it (unknown fields are ignored)
+  and write all bytes at once, so treat delays as best-effort.
+
 ### Scrollback history
 
 The wrapper archives every line that scrolls off the (primary) screen —

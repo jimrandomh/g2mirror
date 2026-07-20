@@ -364,6 +364,128 @@ async fn input_reaches_the_wrapped_program() {
     wrapper.kill().await.ok();
 }
 
+/// Apply output messages to `device` until the pty echo of `needle` shows
+/// on its screen (read_msg's timeout bounds the wait).
+async fn wait_for_echo(
+    device: &mut vt100::Parser,
+    viewer: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    needle: &str,
+) {
+    while !device.screen().contents().contains(needle) {
+        let msg = read_msg(viewer).await;
+        if msg["type"] == "output" {
+            device.process(&base64_decode(msg["data"].as_str().unwrap()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn input_delays_pause_the_write_and_queue_later_input() {
+    let dir = test_dir("indelay");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["cat"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket_path = find_socket(&dir, wrapper.id().unwrap()).await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut viewer = BufReader::new(read_half);
+    assert_eq!(read_msg(&mut viewer).await["type"], "connect");
+
+    // First message pauses 300ms before its trailing \r; the second is sent
+    // immediately but must queue behind that pause.
+    let delayed = base64_encode(b"aaa\r");
+    let followup = base64_encode(b"bbb\r");
+    write_half
+        .write_all(
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                r#"{"type":"init","version":1,"device":"t","width":96,"height":24}"#,
+                r#"{"type":"view"}"#,
+                format_args!(
+                    r#"{{"type":"input","data":"{delayed}","delays":[{{"at":3,"ms":300}}]}}"#
+                ),
+                format_args!(r#"{{"type":"input","data":"{followup}"}}"#),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_msg(&mut viewer).await["type"], "snapshot");
+
+    let mut device = vt100::Parser::new(24, 96, 0);
+    wait_for_echo(&mut device, &mut viewer, "aaa").await;
+    let echoed_first = tokio::time::Instant::now();
+    wait_for_echo(&mut device, &mut viewer, "bbb").await;
+    let elapsed = echoed_first.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "queued input arrived only {elapsed:?} after the delayed chunk; \
+         the 300ms pause was not honored"
+    );
+
+    wrapper.kill().await.ok();
+}
+
+#[tokio::test]
+async fn invalid_input_delays_are_a_protocol_error() {
+    let dir = test_dir("baddelay");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["sh", "-c", "sleep 2"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket_path = find_socket(&dir, wrapper.id().unwrap()).await;
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut viewer = BufReader::new(read_half);
+    assert_eq!(read_msg(&mut viewer).await["type"], "connect");
+
+    // Offset past the end of the (3-byte) data.
+    let input = base64_encode(b"abc");
+    write_half
+        .write_all(
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"init","version":1,"device":"t","width":96,"height":24}"#,
+                format_args!(
+                    r#"{{"type":"input","data":"{input}","delays":[{{"at":9,"ms":100}}]}}"#
+                ),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let reply = read_msg(&mut viewer).await;
+    assert_eq!(reply["type"], "error");
+    assert!(
+        reply["message"].as_str().unwrap().contains("delay"),
+        "unexpected error: {reply}"
+    );
+    // Unlike the read-only rejection, this drops the connection.
+    let mut line = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), viewer.read_line(&mut line))
+        .await
+        .expect("timed out waiting for close")
+        .expect("read failed");
+    assert_eq!(n, 0, "connection survived a protocol error: {line}");
+
+    wrapper.kill().await.ok();
+}
+
 #[tokio::test]
 async fn readonly_wrapper_rejects_input_without_dropping_connection() {
     let dir = test_dir("readonly");
