@@ -193,6 +193,116 @@ async fn viewer_tui_lists_attaches_mirrors_and_detaches() {
     wrapper.kill().await.ok();
 }
 
+/// When the viewer's terminal is shorter than the stream (its token ranks
+/// below "host" in size_precedence), the view shows the *bottom* of the
+/// mirrored screen, and Ctrl+L pushes the hidden top rows into the local
+/// terminal's native scrollback.
+#[tokio::test]
+async fn short_viewer_shows_bottom_and_ctrl_l_fills_scrollback() {
+    let dir = test_dir("vcrop");
+    let token = "crop-token";
+    let hash: String = sha2::Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(
+        dir.join("config.json"),
+        json!({
+            "listen_addr": "127.0.0.1", "port": 0,
+            // The host terminal outranks the viewer, so the stream stays at
+            // the wrapper's (fallback) 24 rows.
+            "auth_tokens": [{"name": "viewer", "token_hash": hash}],
+            "size_precedence": ["host", "viewer"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 20 numbered lines fill the wrapped 24-row screen without scrolling.
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["sh", "-c", "seq 1 20; cat"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let wrapper_pid = wrapper.id().unwrap();
+    find_socket(&dir, wrapper_pid).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut server = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror-server"))
+        .env("G2MIRROR_DIR", &dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut server_out = BufReader::new(server.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), server_out.read_line(&mut line))
+        .await
+        .expect("server did not start")
+        .unwrap();
+    let addr = line.trim().rsplit(' ').next().unwrap().to_string();
+
+    // A 15-row viewer terminal against the 24-row stream: crop of 9.
+    let (pty, pts) = pty_process::open().unwrap();
+    pty.resize(pty_process::Size::new(15, 80)).unwrap();
+    let mut viewer = pty_process::Command::new(env!("CARGO_BIN_EXE_g2mirror-view"))
+        .arg(format!("g2mirror://{token}@{addr}"))
+        .spawn(pts)
+        .unwrap();
+    let (mut vread, mut vwrite) = pty.into_split();
+    let mut term = vt100::Parser::new(15, 80, 200);
+
+    let pid_str = wrapper_pid.to_string();
+    read_until(&mut vread, &mut term, "the session list", |s| {
+        s.contents().contains(&pid_str)
+    })
+    .await;
+    vwrite.write_all(b"\r").await.unwrap();
+    read_until(&mut vread, &mut term, "the bottom of the viewport", |s| {
+        s.contents().contains("20") && !s.contents().contains("g2mirror-view")
+    })
+    .await;
+    let numbers = |term: &mut vt100::Parser| -> Vec<u32> {
+        all_lines(term)
+            .iter()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    };
+    assert_eq!(
+        numbers(&mut term),
+        (10..=20).collect::<Vec<u32>>(),
+        "the visible region shows the bottom of the mirrored screen"
+    );
+
+    // Ctrl+L pushes the hidden top rows (1..9) into the local scrollback.
+    vwrite.write_all(&[0x0c]).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let expected: Vec<u32> = (1..=20).collect();
+    loop {
+        if numbers(&mut term) == expected {
+            break;
+        }
+        let mut buf = [0u8; 16 * 1024];
+        let n = tokio::time::timeout_at(deadline, vread.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("scrollback never completed; lines:\n{:?}", all_lines(&mut term))
+            })
+            .expect("viewer pty closed early");
+        term.process(&buf[..n]);
+    }
+
+    viewer.kill().await.ok();
+    server.kill().await.ok();
+    wrapper.kill().await.ok();
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)

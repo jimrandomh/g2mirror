@@ -632,6 +632,17 @@ impl App {
                     Some(pos) => (&bytes[..pos], true),
                     None => (bytes, false),
                 };
+                // Ctrl+L: re-push the hidden top rows into the local
+                // scrollback (healing stale copies) and repaint. Still
+                // forwarded below, so the app's own Ctrl+L behavior (e.g.
+                // a shell's redraw) is preserved.
+                if input.contains(&0x0c)
+                    && let Mode::Live { mirror } = &self.mode
+                {
+                    let out = mirror.refresh_scrollback();
+                    self.stdout.write_all(&out).await?;
+                    self.stdout.flush().await?;
+                }
                 if !input.is_empty() && !self.token_readonly && !self.session_readonly {
                     send_json(
                         ws,

@@ -83,6 +83,16 @@ tolerates this mismatch natively, and re-synchronizes automatically when
 the stream size changes. Unlisted tokens rank below everything listed;
 with no list at all, any viewer resizes the app (the original behavior).
 
+When the stream is *taller* than a viewer's terminal (or than the host
+terminal), the visible region shows the bottom of the mirrored screen; the
+hidden top rows are pushed into that terminal's native scrollback, so
+scrolling up shows the whole screen. Those pushed copies are point-in-time
+— if the app later edits rows that are above the fold, the scrollback
+copies go stale (tolerated) — and **Ctrl+L** pushes fresh copies and
+repaints (in g2mirror-view and on the wrapper's host terminal alike; the
+keystroke is still forwarded to the app, so a shell's usual Ctrl+L
+behavior is preserved).
+
 ## Build & run
 
 ```sh

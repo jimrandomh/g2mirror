@@ -159,6 +159,68 @@ impl Mirror {
         self.host_rows - region_rows
     }
 
+    /// Number of view-model rows hidden above the host screen when the view
+    /// is taller than the host (the host shows the model's bottom): the
+    /// region displays model rows `crop_top()..view.rows`.
+    fn crop_top(&self) -> u16 {
+        self.view
+            .map_or(0, |v| v.rows.saturating_sub(self.host_rows))
+    }
+
+    /// Bytes that copy the hidden top rows of the view model into the host
+    /// terminal's native scrollback, so scrolling up shows the whole
+    /// mirrored screen. The copies are point-in-time: the model may edit
+    /// those rows afterwards, leaving stale scrollback until the next push
+    /// (`refresh_scrollback`, wired to Ctrl+L) — an accepted inaccuracy.
+    /// The caller must follow with a full region repaint.
+    fn push_crop_to_host_scrollback(&self) -> Vec<u8> {
+        let crop = usize::from(self.crop_top());
+        if crop == 0 {
+            return Vec::new();
+        }
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let mut out = SYNC_BEGIN.to_vec();
+        out.extend_from_slice(HIDE_CURSOR);
+        // Autowrap off: a line wider than the host must truncate in place,
+        // or the row accounting below breaks (matching the region display,
+        // which also truncates at the host width).
+        out.extend_from_slice(b"\x1b[?7l");
+        // Paint batches of hidden rows over the top of the screen, then
+        // scroll exactly that many lines: precisely the painted rows enter
+        // the scrollback. The repaint that follows fixes the display.
+        let mut pushed = 0;
+        while pushed < crop {
+            let batch = (crop - pushed).min(usize::from(self.host_rows));
+            for i in 0..batch {
+                out.extend_from_slice(SGR_RESET);
+                out.extend_from_slice(cup(i as u16, 0).as_bytes());
+                out.extend_from_slice(CLEAR_TO_EOL);
+                out.extend_from_slice(&serialize_row(screen, (pushed + i) as u16, cols).bytes);
+            }
+            out.extend_from_slice(SGR_RESET);
+            out.extend_from_slice(cup(self.host_rows.saturating_sub(1), 0).as_bytes());
+            out.extend_from_slice(&b"\r\n".repeat(batch));
+            pushed += batch;
+        }
+        out.extend_from_slice(b"\x1b[?7h");
+        out.extend_from_slice(SYNC_END);
+        out
+    }
+
+    /// Re-push the hidden top rows into the host's native scrollback (fresh
+    /// copies healing any stale ones) and repaint the region. Wired to
+    /// Ctrl+L on the host and in g2mirror-view; empty when nothing is
+    /// being mirrored.
+    pub fn refresh_scrollback(&self) -> Vec<u8> {
+        if self.view.is_none() {
+            return Vec::new();
+        }
+        let mut out = self.push_crop_to_host_scrollback();
+        out.extend_from_slice(&self.render_host_full());
+        out
+    }
+
     /// Bytes that push the history zone's contents into the host terminal's
     /// native scrollback (by scrolling the whole host screen up past it).
     /// Used before anything clears the zone.
@@ -231,6 +293,7 @@ impl Mirror {
             },
             Some(view) => {
                 let offset = self.region_offset();
+                let crop = self.crop_top();
                 let mut host = Vec::new();
                 if scrolled > 0 {
                     // Mirror the scroll for real on the host so its native
@@ -280,6 +343,7 @@ impl Mirror {
                         self.host_cols,
                         true,
                         offset,
+                        crop,
                     ));
                 } else {
                     host.extend_from_slice(&render_rows(
@@ -289,6 +353,7 @@ impl Mirror {
                         self.host_cols,
                         false,
                         offset,
+                        crop,
                     ));
                 }
                 // The render paths only reproduce screen contents, so a
@@ -411,8 +476,10 @@ impl Mirror {
         // No clear: the live region redraws the bottom of the host screen
         // in place (it shows the same bottom-anchored content the host was
         // already displaying), and whatever is above it stays visible as
-        // the initial history zone.
+        // the initial history zone. When the view is taller than the host,
+        // the hidden top rows go into the host's native scrollback instead.
         let mut host_output = VIEW_HOST_PRELUDE.to_vec();
+        host_output.extend_from_slice(&self.push_crop_to_host_scrollback());
         host_output.extend_from_slice(&self.render_host_full());
         Transition {
             child_size: Some((view.rows, view.cols)),
@@ -493,10 +560,12 @@ impl Mirror {
             }
             // The device screen stays at its fixed size; only our layout on
             // the host changed, so repaint the whole host frame (after
-            // rescuing the history zone into the host's scrollback).
+            // rescuing the history zone — or, when the view no longer fits,
+            // the freshly hidden top rows — into the host's scrollback).
             Some(_) => {
                 let mut host_output = self.push_zone_to_host_scrollback();
                 self.zone_dirty = false;
+                host_output.extend_from_slice(&self.push_crop_to_host_scrollback());
                 host_output.extend_from_slice(CLEAR);
                 host_output.extend_from_slice(&self.render_host_full());
                 Transition {
@@ -521,6 +590,7 @@ impl Mirror {
             self.host_cols,
             true,
             self.region_offset(),
+            self.crop_top(),
         )
     }
 
@@ -551,11 +621,13 @@ fn blank_screen(rows: u16, cols: u16) -> vt100::Screen {
 /// Render the part of `screen` that fits in a `host_rows` x `host_cols`
 /// terminal, as a diff from `prev` (same size as `screen`), placed with its
 /// top at host row `row_offset` (the live region is anchored at the bottom
-/// of the host screen; rows above it are the history zone). Every row is
-/// explicitly positioned, so the output is correct on any terminal at least
-/// as large as the rendered window. `full` selects full-state emission for
-/// a target whose region contents are unknown: every region row is cleared
-/// and redrawn rather than diffed.
+/// of the host screen; rows above it are the history zone). `src_off` skips
+/// that many rows at the top of the model — when the view is taller than
+/// the host, the host shows the model's bottom. Every row is explicitly
+/// positioned, so the output is correct on any terminal at least as large
+/// as the rendered window. `full` selects full-state emission for a target
+/// whose region contents are unknown: every region row is cleared and
+/// redrawn rather than diffed.
 fn render_rows(
     screen: &vt100::Screen,
     prev: &vt100::Screen,
@@ -563,25 +635,28 @@ fn render_rows(
     host_cols: u16,
     full: bool,
     row_offset: u16,
+    src_off: u16,
 ) -> Vec<u8> {
     let (screen_rows, screen_cols) = screen.size();
-    let rows = host_rows.min(screen_rows);
+    let rows = host_rows.min(screen_rows.saturating_sub(src_off));
     let cols = host_cols.min(screen_cols);
     let mut out = SYNC_BEGIN.to_vec();
     out.extend_from_slice(HIDE_CURSOR);
     for (i, row_diff) in screen
         .rows_diff(prev, 0, cols)
-        .take(rows.into())
         .enumerate()
+        .skip(src_off.into())
+        .take(rows.into())
     {
+        let target_row = row_offset + i as u16 - src_off;
         if full {
             out.extend_from_slice(SGR_RESET);
-            out.extend_from_slice(cup(row_offset + i as u16, 0).as_bytes());
+            out.extend_from_slice(cup(target_row, 0).as_bytes());
             out.extend_from_slice(CLEAR_TO_EOL);
             out.extend_from_slice(&row_diff);
         } else if !row_diff.is_empty() {
             out.extend_from_slice(SGR_RESET);
-            out.extend_from_slice(cup(row_offset + i as u16, 0).as_bytes());
+            out.extend_from_slice(cup(target_row, 0).as_bytes());
             out.extend_from_slice(&row_diff);
         }
     }
@@ -590,7 +665,7 @@ fn render_rows(
     } else {
         out.extend_from_slice(&screen.input_mode_diff(prev));
     }
-    place_cursor(&mut out, screen, 0, rows, cols, row_offset);
+    place_cursor(&mut out, screen, src_off, rows, cols, row_offset);
     out.extend_from_slice(SYNC_END);
     out
 }
@@ -938,19 +1013,73 @@ mod tests {
         assert_eq!(host.screen().cursor_position(), (0, 9));
     }
 
+    /// A view taller than the host shows the model's *bottom* rows (where
+    /// the prompt and fresh output live); the hidden top rows are pushed
+    /// into the host's native scrollback, refreshed on demand (Ctrl+L).
     #[test]
-    fn tall_content_truncated_on_short_host() {
+    fn tall_view_shows_bottom_and_ctrl_l_pushes_hidden_top_to_scrollback() {
         let mut mirror = Mirror::new(10, 120);
-        let mut host = term(10, 120);
-        start_view(&mut mirror, &mut host);
-        // Write a marker on view row 15, below the 10-row host window.
-        host.process(
-            &mirror
-                .process(b"\x1b[15;1Hbelow-the-fold\x1b[1;1Htop")
-                .host,
+        let mut host = vt100::Parser::new(10, 120, 100);
+        // SIM view is 24 rows on a 10-row host: model rows 0..14 hidden.
+        host.process(&mirror.start_view(SIM).host_output);
+        let out = mirror.process(b"\x1b[15;1Hvisible-bottom\x1b[1;1Htop-hidden");
+        host.process(&out.host);
+        // Model row 14 (CSI row 15) is the first visible row -> host row 0.
+        assert_eq!(host.screen().contents_between(0, 0, 0, 14), "visible-bottom");
+        assert!(!host.screen().contents().contains("top-hidden"));
+        // The cursor ended on a hidden row: not shown.
+        assert!(host.screen().hide_cursor());
+
+        // The hidden row was written after the view started, so the copy
+        // pushed at view start is stale (blank); Ctrl+L heals it.
+        host.process(&mirror.refresh_scrollback());
+        let lines = host_lines(&mut host);
+        assert_eq!(
+            lines,
+            vec!["top-hidden".to_string(), "visible-bottom".to_string()],
+            "scrollback + screen show the whole model, in order"
         );
-        assert_eq!(host.screen().contents_between(0, 0, 0, 3), "top");
-        assert!(!host.screen().contents().contains("below-the-fold"));
+    }
+
+    /// Scroll mirroring and the hidden-top push compose: after a Ctrl+L,
+    /// scrollback + screen reproduce every line of a scrolled session in
+    /// order, even though the middle rows were never visible on the host.
+    #[test]
+    fn crop_case_scrollback_is_complete_after_refresh() {
+        let mut mirror = Mirror::new(5, 40);
+        let mut host = vt100::Parser::new(5, 40, 100);
+        let t = mirror.start_view(View {
+            rows: 8,
+            cols: 40,
+            simulated: true,
+        });
+        host.process(&t.host_output);
+        // 13 lines through an 8-row model: L1..L5 scroll into history (and
+        // the host's scrollback); the model shows L6..end, of which only
+        // the bottom 5 rows (L9..end) fit the host screen.
+        let mut bytes = Vec::new();
+        for i in 1..=12 {
+            bytes.extend_from_slice(format!("L{i}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"end");
+        host.process(&mirror.process(&bytes).host);
+        let expect = |nums: &[u32]| {
+            let mut v: Vec<String> = nums.iter().map(|i| format!("L{i}")).collect();
+            v.push("end".into());
+            v
+        };
+        assert_eq!(
+            host_lines(&mut host),
+            expect(&[1, 2, 3, 4, 5, 9, 10, 11, 12]),
+            "scrolled lines reach scrollback; L6..L8 are hidden model rows"
+        );
+        // Ctrl+L pushes the hidden rows, completing the sequence in order.
+        host.process(&mirror.refresh_scrollback());
+        assert_eq!(
+            host_lines(&mut host),
+            expect(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            "after refresh, nothing is missing and order holds"
+        );
     }
 
     #[test]
@@ -1249,12 +1378,20 @@ mod tests {
         let mut mirror = Mirror::new(40, 120);
         let mut host = term(40, 120);
         start_view(&mut mirror, &mut host);
-        host.process(&mirror.process(b"steady").host);
-        // Host shrinks below the view size; child must NOT be resized.
+        host.process(&mirror.process(b"steady\x1b[24;1Hbottom").host);
+        // Host shrinks below the view's 24 rows; child must NOT be resized.
+        // The view model's bottom stays visible; "steady" (model row 0) is
+        // now above the fold and gets pushed into the host's scrollback.
         let t = mirror.host_resized(20, 60);
         assert_eq!(t.child_size, None);
-        let mut small_host = term(20, 60);
+        let mut small_host = vt100::Parser::new(20, 60, 100);
         small_host.process(&t.host_output);
-        assert_eq!(small_host.screen().contents_between(0, 0, 0, 6), "steady");
+        // Model row 23 -> host row 19 (crop of 4).
+        assert_eq!(small_host.screen().contents_between(19, 0, 19, 6), "bottom");
+        assert_eq!(
+            host_lines(&mut small_host),
+            vec!["steady".to_string(), "bottom".to_string()],
+            "the hidden top row is preserved in scrollback"
+        );
     }
 }

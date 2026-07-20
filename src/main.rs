@@ -24,6 +24,11 @@ use mirror::{Mirror, View};
 /// Ctrl+G: simulate a device connect/disconnect.
 const HOTKEY: u8 = 0x07;
 
+/// Ctrl+L (also forwarded to the child): while a view taller than the host
+/// terminal is active, re-push the hidden top rows into the host's native
+/// scrollback and repaint.
+const REFRESH_KEY: u8 = 0x0c;
+
 /// Bell notifications are debounced to at most one per this window.
 const BELL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -45,6 +50,7 @@ fn usage() -> ! {
         history::DEFAULT_MAX_LINES
     );
     eprintln!("  Ctrl+G simulates glasses connect/disconnect");
+    eprintln!("  Ctrl+L (passed through) refreshes mirrored scrollback while viewing");
     std::process::exit(2);
 }
 
@@ -211,6 +217,15 @@ async fn run(
                         rest = &rest[pos + 1..];
                     }
                     pty_write.write_all(rest).await?;
+                    if stdin_buf[..n].contains(&REFRESH_KEY) {
+                        // Ctrl+L (already forwarded above): refresh the
+                        // mirrored scrollback and repaint while viewing.
+                        let out = mirror.refresh_scrollback();
+                        if !out.is_empty() {
+                            stdout.write_all(&out).await?;
+                            stdout.flush().await?;
+                        }
+                    }
                 }
                 Err(e) => return Err(e).context("error reading stdin"),
             },
