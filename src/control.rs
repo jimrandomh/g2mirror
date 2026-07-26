@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use g2mirror::protocol::{FromSession, ToSession};
+use g2mirror::protocol::{FromSession, Role, ToSession};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -114,6 +114,9 @@ pub struct Client {
     pub height: u16,
     /// Size-precedence rank from the init message (lower wins the size).
     pub size_rank: u32,
+    /// Role from the init message; a host-role client's size ranks as
+    /// `"host"` instead of by `size_rank`.
+    pub role: Role,
     /// Arrival order, the tie-break between equally ranked viewers.
     pub id: u64,
     /// Marked when a send fails; swept out of the viewer list at safe
@@ -131,6 +134,7 @@ impl Client {
             width: 0,
             height: 0,
             size_rank: 0,
+            role: Role::Viewer,
             id,
             dead: false,
         }

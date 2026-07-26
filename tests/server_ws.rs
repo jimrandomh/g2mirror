@@ -583,15 +583,20 @@ async fn init_config_and_add_token_flow() {
         assert!(!out.status.success(), "--add-token {name} must fail");
     }
 
-    let config: Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    // The template is commented JSON, and --add-token edits preserve the
+    // comments.
+    let text = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    assert!(text.contains("//"), "template must contain comments:\n{text}");
+    let config: Value = serde_json::from_str(&g2mirror::jsonc::strip_comments(&text)).unwrap();
     assert_eq!(config["auth_tokens"].as_array().unwrap().len(), 2);
     assert_eq!(config["size_precedence"], json!(["glasses", "host"]));
 
-    // Make the port ephemeral so the test can't collide with a real server.
-    let mut config = config;
-    config["port"] = json!(0);
-    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    // Make the port ephemeral so the test can't collide with a real
+    // server — textually, so the comments stay and the server proves it
+    // parses a commented config.
+    let text = text.replace("\"port\": 8737", "\"port\": 0");
+    assert!(text.contains("\"port\": 0"), "port line not found:\n{text}");
+    std::fs::write(dir.join("config.json"), text).unwrap();
 
     let (mut server, addr) = start_server(&dir).await;
     let (_ws, reply) = connect_device(&addr, &glasses_token).await;
@@ -652,4 +657,262 @@ async fn readonly_server_rejects_input() {
     let reply = recv(&mut ws).await;
     assert_eq!(reply["type"], "error");
     assert_eq!(reply["message"], "server is read-only");
+}
+
+/// Kill a leaked process on drop (launched wrappers are setsid'd, so a
+/// failing test would otherwise leave them running forever).
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &self.0.to_string()])
+            .status();
+    }
+}
+
+#[tokio::test]
+async fn launch_starts_a_detached_session_and_enforces_grants() {
+    let dir = test_dir("launch");
+    std::fs::write(
+        dir.join("config.json"),
+        json!({
+            "listen_addr": "127.0.0.1", "port": 0,
+            "auth_tokens": [
+                {"name": "glasses", "token_hash": sha256_hex("g-token"),
+                 "readonly": false, "launch": ["run"]},
+                {"name": "spectator", "token_hash": sha256_hex("s-token")}
+            ],
+            "launch": {
+                // cwd "/" keeps the socket path under the sun_path limit.
+                "run": {"argv": ["sh", "-c", "printf 'launched-out\\n'; cat"],
+                        "cwd": "/", "title": "launched run"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (mut server, addr) = start_server(&dir).await;
+
+    // A granted, writable token launches its preset and gets the socket.
+    let (mut glasses, reply) = connect_device(&addr, "g-token").await;
+    assert_eq!(reply["type"], "init");
+    send(&mut glasses, json!({"type": "launch", "command": "run"})).await;
+    let reply = recv(&mut glasses).await;
+    assert_eq!(reply["type"], "launched", "launch failed: {reply}");
+    let socket = reply["socket"].as_str().unwrap().to_string();
+    let pid: u32 = socket.split('-').next().unwrap().parse().unwrap();
+    let _cleanup = KillOnDrop(pid);
+
+    // Once the server's monitor has greeted the new session, it lists as
+    // detached with its launch preset.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "launched session never listed as detached"
+        );
+        send(&mut glasses, json!({"type": "list"})).await;
+        let msg = loop {
+            let msg = recv(&mut glasses).await;
+            if msg["type"] == "sessions" {
+                break msg;
+            }
+        };
+        let found = msg["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["socket"] == socket.as_str())
+            .cloned();
+        if let Some(s) = found
+            && s["detached"] == true
+        {
+            assert_eq!(s["launched"], "run");
+            assert_eq!(s["title"], "launched run");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Connecting and viewing works like any session; the greeting shows it
+    // headless, and the app's output is in the snapshot/stream.
+    send(&mut glasses, json!({"type": "connect", "socket": socket})).await;
+    let greeting = loop {
+        let msg = recv(&mut glasses).await;
+        if msg["type"] == "connect" {
+            break msg;
+        }
+    };
+    assert_eq!(greeting["headless"], true);
+    assert_eq!(greeting["launched"], "run");
+    send(&mut glasses, json!({"type": "view"})).await;
+    let mut device = vt100::Parser::new(24, 96, 0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "launched app output never arrived; screen:\n{}",
+            device.screen().contents()
+        );
+        let msg = recv(&mut glasses).await;
+        if (msg["type"] == "snapshot" || msg["type"] == "output")
+            && let Some(data) = msg["data"].as_str()
+        {
+            use base64::Engine as _;
+            device.process(
+                &base64::engine::general_purpose::STANDARD.decode(data).unwrap(),
+            );
+        }
+        if device.screen().contents().contains("launched-out") {
+            break;
+        }
+    }
+
+    // Refusals: cwd override without allow_cwd; a preset outside the
+    // grant (including the implicit "shell" default); any launch by an
+    // ungranted (and read-only) token.
+    send(&mut glasses, json!({"type": "launch", "command": "run", "cwd": "/"})).await;
+    let reply = recv(&mut glasses).await;
+    assert_eq!(reply["type"], "error");
+    assert!(reply["message"].as_str().unwrap().contains("overrid"), "{reply}");
+    send(&mut glasses, json!({"type": "launch"})).await;
+    let reply = recv(&mut glasses).await;
+    assert_eq!(reply["type"], "error");
+    assert!(reply["message"].as_str().unwrap().contains("may not launch"), "{reply}");
+    let (mut spectator, _) = connect_device(&addr, "s-token").await;
+    send(&mut spectator, json!({"type": "launch", "command": "run"})).await;
+    let reply = recv(&mut spectator).await;
+    assert_eq!(reply["type"], "error");
+    assert!(reply["message"].as_str().unwrap().contains("may not launch"), "{reply}");
+
+    server.kill().await.ok();
+}
+
+#[tokio::test]
+async fn bad_launch_configs_fail_at_startup() {
+    for (tag, config, needle) in [
+        (
+            "rolaunch",
+            json!({
+                "listen_addr": "127.0.0.1", "port": 0,
+                "auth_tokens": [{"name": "t", "token_hash": "aa", "launch": true}],
+                "launch": {"shell": {"argv": ["sh"]}}
+            }),
+            "read-only but has a launch grant",
+        ),
+        (
+            "ghost",
+            json!({
+                "listen_addr": "127.0.0.1", "port": 0,
+                "auth_tokens": [{"name": "t", "token_hash": "aa",
+                                 "readonly": false, "launch": ["ghost"]}]
+            }),
+            "no such launch preset",
+        ),
+        (
+            "emptyargv",
+            json!({
+                "listen_addr": "127.0.0.1", "port": 0,
+                "auth_tokens": [{"name": "t", "token_hash": "aa"}],
+                "launch": {"shell": {"argv": []}}
+            }),
+            "empty argv",
+        ),
+        (
+            "badsize",
+            json!({
+                "listen_addr": "127.0.0.1", "port": 0,
+                "auth_tokens": [{"name": "t", "token_hash": "aa"}],
+                "launch": {"shell": {"argv": ["sh"], "size": "big"}}
+            }),
+            "bad size",
+        ),
+    ] {
+        let dir = test_dir(tag);
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror-server"))
+            .env("G2MIRROR_DIR", &dir)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(!out.status.success(), "{tag}: server must refuse to start");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{tag}: stderr was: {stderr}");
+    }
+}
+
+#[tokio::test]
+async fn add_token_launch_flags() {
+    let dir = test_dir("addlaunch");
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror-server"))
+        .arg("--init-config")
+        .env("G2MIRROR_DIR", &dir)
+        .env("SHELL", "/bin/zsh")
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+
+    // --init-config seeds a "shell" preset from $SHELL and grants launch to
+    // the glasses token.
+    let config: Value =
+        serde_json::from_str(&g2mirror::jsonc::strip_comments(
+            &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(config["launch"]["shell"]["argv"], json!(["/bin/zsh", "-l"]));
+    assert_eq!(config["auth_tokens"][0]["name"], "glasses");
+    assert_eq!(config["auth_tokens"][0]["launch"], true);
+
+    // A launch grant without --writable is refused.
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror-server"))
+        .args(["--add-token", "rob", "--launch", "shell"])
+        .env("G2MIRROR_DIR", &dir)
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--writable"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A grant naming a missing preset is refused.
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror-server"))
+        .args(["--add-token", "rob", "--writable", "--launch", "ghost"])
+        .env("G2MIRROR_DIR", &dir)
+        .output()
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no launch preset"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The valid form records the named grant.
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror-server"))
+        .args(["--add-token", "rob", "--writable", "--launch", "shell"])
+        .env("G2MIRROR_DIR", &dir)
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let config: Value =
+        serde_json::from_str(&g2mirror::jsonc::strip_comments(
+            &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+        ))
+        .unwrap();
+    let rob = config["auth_tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "rob")
+        .unwrap();
+    assert_eq!(rob["readonly"], false);
+    assert_eq!(rob["launch"], json!(["shell"]));
 }

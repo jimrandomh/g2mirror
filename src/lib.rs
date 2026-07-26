@@ -1,4 +1,5 @@
 pub mod history;
+pub mod jsonc;
 pub mod mirror;
 pub mod paths;
 pub mod protocol;

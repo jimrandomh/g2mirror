@@ -108,7 +108,7 @@ Failure reply (`error`), then the server closes the connection:
 {"type": "sessions", "sessions": [
   {"socket": "84210-_Users_jim_repos_myproj", "pid": 84210,
    "cwd_hint": "_Users_jim_repos_myproj", "last_bell_at": 1782264921042,
-   "title": "vim notes.md"}
+   "title": "vim notes.md", "detached": true, "launched": "shell"}
 ]}
 ```
 
@@ -122,7 +122,11 @@ or an agent's status line); until the app sets one it is the wrapper's
 since the server began monitoring the terminal (the server monitors every
 terminal from the moment it discovers its socket, whether or not any device
 is attached; it does not know about bells or titles from before then or
-while the server was down).
+while the server was down). `detached` (absent means false) marks a
+headless session nobody currently holds the host role of — one the user
+can claim into a terminal with `g2mirror --attach` — and `launched` names
+the launch preset it was started from, if any (both absent for ordinary
+hosted sessions).
 
 **`{"type": "connect", "socket": "84210-_Users_jim_repos_myproj"}`** —
 attach to a session. The server dials the session socket and sends it a
@@ -134,6 +138,26 @@ next message you receive is the session's `connect` (below).
 `{"type": "disconnected", "reason": "requested"}`. You also receive a
 `disconnected` message if the session ends or errors out
 (`"reason": "session closed"`).
+
+**`{"type": "launch", "command": "shell", "cwd": "/optional/override"}`** —
+start a new detached session from a **launch preset** in the server config
+(see README: the config maps preset names to argv/cwd/title/env; the wire
+can only pick presets by name, never supply a command line). `command`
+defaults to `"shell"`. `cwd` is rejected unless the preset opts in with
+`allow_cwd`. Requires a writable token with a launch grant covering the
+preset. Success reply:
+
+```json
+{"type": "launched", "socket": "91327-_Users_jim"}
+```
+
+The new session starts headless (no host terminal) and detached; follow up
+with a normal `connect` to that socket and `view` it like any other
+session. It keeps running when you disconnect — the user can later claim
+it into a real terminal with `g2mirror --attach`, and its pty keeps its
+last viewed size when no one is viewing. On failure you get an `error`
+(no grant, unknown preset, cwd not allowed, spawn failure, or the token's
+own filter would hide the session it just launched).
 
 ### Unsolicited bell and title notifications
 
@@ -163,6 +187,16 @@ OSC 2, BEL- or ST-terminated), every authenticated device receives:
 Title notifications are sent on change only (repeated sets of the same
 title are suppressed) and are not debounced. An empty string is a valid
 title (apps use it to clear the title bar).
+
+And whenever a headless session's host role is claimed or released (its
+`detached` state flipped), every authenticated device receives:
+
+```json
+{"type": "detached", "socket": "91327-_Users_jim", "detached": false}
+```
+
+Use it to keep a "claimable sessions" indicator live without polling
+`list`.
 
 ### Relay
 
@@ -195,6 +229,21 @@ same list); lower ranks win the app's size. Clients connecting to the
 session socket directly may omit both, which gives them rank 0 and keeps
 the host below every viewer.
 
+An `init` may also declare `"role": "host"` (default `"viewer"`) on a
+**headless** session: the client's size then occupies the `"host"` slot in
+the precedence order instead of ranking by token, and the session stops
+counting as detached. This is how `g2mirror --attach` claims a detached
+session; drivers never need it. At most one client holds the role — a
+second host-role init is refused unless it adds `"force": true`, which
+displaces the previous holder (it gets an `error` and is dropped). On a
+session with a real host terminal, host-role inits are always refused.
+
+Any viewer may later send `{"type": "resize", "width": 100, "height": 30}`
+to update the dimensions it declared in `init` (host-role clients forward
+SIGWINCH this way). If the sender currently controls the view size, the
+stream restarts at the new dimensions and every viewing client receives a
+fresh `snapshot`.
+
 ### Snapshot dimensions and size precedence
 
 When several clients view one terminal at once, the wrapped app is resized
@@ -220,13 +269,22 @@ its own size, but should still be prepared for an unsolicited one.
 ```json
 {"type": "connect", "version": 1, "pid": 84210, "command": "vim notes.md",
  "cwd": "/Users/jim/repos/myproj", "host_width": 143, "host_height": 40,
- "readonly": false, "history": {"next": 1523, "oldest": 0}}
+ "readonly": false, "history": {"next": 1523, "oldest": 0},
+ "title": "vim notes.md"}
 ```
 
 `host_width`/`host_height` are the size of the terminal the wrapper is
-running in (cells), for display purposes. `readonly` is true when the
+running in (cells), for display purposes; on a headless session they are
+the mirror's current model size instead. `readonly` is true when the
 wrapper was started with `--readonly` and will reject `input`. `history`
 is the scrollback archive extent (see "Scrollback history" below).
+`title` is the current window title if one is set (also pushed as `title`
+messages on change; carried here so one-shot probes of the socket, like
+`g2mirror --list`, see it). Three more optional fields, omitted when
+false/absent: `headless` marks a wrapper running without a host terminal
+(`--headless`/`--detached`/server-launched), `detached` means headless
+with no client holding the host role, and `launched` names the server
+launch preset the session came from.
 
 **`snapshot`** — the immediate answer to `view`, and re-sent unsolicited
 whenever the stream's dimensions change (see "Snapshot dimensions and size
@@ -273,6 +331,17 @@ Sent to both the viewer and the monitor whenever the title changes, and
 once on attach if the app has already set one. While viewing, the wrapper
 also re-emits the title sequence on its host terminal, so the host title
 bar stays in sync too.
+
+**`host_changed`** — a headless session's host role was claimed or
+released (its detached state flipped); sent to the monitor and every
+viewer:
+
+```json
+{"type": "host_changed", "attached": true}
+```
+
+The server turns this into the device-facing `detached` push; drivers
+attached directly to the session may ignore it.
 
 **`error`** — protocol violation report; the wrapper closes the connection
 after sending it.

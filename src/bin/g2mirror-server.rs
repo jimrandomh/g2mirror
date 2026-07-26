@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use futures_util::{SinkExt as _, StreamExt as _};
-use g2mirror::paths;
+use g2mirror::{jsonc, paths};
 use g2mirror::protocol::{DeviceInit, ServerToDevice, SessionInfo, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -44,6 +44,11 @@ struct TerminalState {
     /// Real working directory, from the session's connect greeting (the
     /// socket name only carries a sanitized, truncated form).
     cwd: Option<String>,
+    /// Headless session with no host-role client: claimable with
+    /// `g2mirror --attach`.
+    detached: bool,
+    /// Launch preset the session was started from, if any.
+    launched: Option<String>,
 }
 
 /// Terminal tracking, shared between the monitor tasks (one per session
@@ -94,10 +99,79 @@ struct TokenConfig {
     /// force-disconnected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     filter: Vec<FilterRule>,
+    /// Launch presets this token may start: `true` (all), or a list of
+    /// preset names. Absent/`false`: none. A launch grant is remote code
+    /// execution by design — give it only to tokens you'd hand a shell —
+    /// and requires the token to be writable (checked at startup).
+    #[serde(default, skip_serializing_if = "LaunchGrant::is_none")]
+    launch: LaunchGrant,
 }
 
 fn default_token_readonly() -> bool {
     true
+}
+
+/// A token's launch permission: a boolean or a list of preset names.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum LaunchGrant {
+    Flag(bool),
+    Named(Vec<String>),
+}
+
+impl Default for LaunchGrant {
+    fn default() -> Self {
+        LaunchGrant::Flag(false)
+    }
+}
+
+impl LaunchGrant {
+    fn allows(&self, preset: &str) -> bool {
+        match self {
+            LaunchGrant::Flag(all) => *all,
+            LaunchGrant::Named(names) => names.iter().any(|n| n == preset),
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        match self {
+            LaunchGrant::Flag(all) => !all,
+            LaunchGrant::Named(names) => names.is_empty(),
+        }
+    }
+}
+
+/// One entry in the config's `launch` map: what a `launch` request for
+/// this preset name starts. The wire can only name presets — argv, env,
+/// and (unless `allow_cwd`) the working directory come from this laptop-
+/// local config, never from the network.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct LaunchPreset {
+    /// Command and arguments; argv[0] is resolved via PATH.
+    argv: Vec<String>,
+    /// Working directory (leading `~` expanded); default: home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    /// Initial window title; default: the preset name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Extra environment, merged over the server's own.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    env: HashMap<String, String>,
+    /// Allow the launch request to override `cwd`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_cwd: bool,
+    /// History lines retained (wrapper --scrollback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scrollback: Option<u32>,
+    /// Start the wrapper read-only (broadcast-style presets).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    readonly: bool,
+    /// Initial pty size as `<cols>x<rows>` before any viewer resizes it;
+    /// default 80x24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
 }
 
 /// One filter rule. Regexes must match the whole value (they are anchored
@@ -211,6 +285,11 @@ struct Config {
     /// no list at all any viewer resizes the app (the original behavior).
     #[serde(default)]
     size_precedence: Vec<String>,
+    /// Named launch presets: commands a suitably-granted token may start
+    /// as detached (headless) sessions. A `launch` request without a name
+    /// uses the preset called "shell".
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    launch: std::collections::BTreeMap<String, LaunchPreset>,
     /// Legacy single-token form: equivalent to an `auth_tokens` entry named
     /// "default" whose readonly flag is `readonly` (defaulting to false, as
     /// it did when this was the only form).
@@ -230,9 +309,47 @@ impl Config {
                 token_hash: hash.clone(),
                 readonly: self.readonly.unwrap_or(false),
                 filter: Vec::new(),
+                launch: LaunchGrant::default(),
             });
         }
         tokens
+    }
+
+    /// Startup validation of the launch configuration: contradictory or
+    /// dangling grants and malformed presets are config errors, not
+    /// launch-time surprises.
+    fn validate_launch(&self) -> anyhow::Result<()> {
+        for (name, preset) in &self.launch {
+            anyhow::ensure!(!preset.argv.is_empty(), "launch preset {name:?} has an empty argv");
+            if let Some(size) = &preset.size {
+                anyhow::ensure!(
+                    parse_preset_size(size),
+                    "launch preset {name:?} has a bad size {size:?} (want e.g. 80x24)"
+                );
+            }
+        }
+        for token in self.tokens() {
+            if token.launch.is_none() {
+                continue;
+            }
+            anyhow::ensure!(
+                !token.readonly,
+                "token {:?} is read-only but has a launch grant; a token that can \
+                 start shells it cannot type into is a contradiction \u{2014} make it \
+                 writable or drop the grant",
+                token.name
+            );
+            if let LaunchGrant::Named(names) = &token.launch {
+                for name in names {
+                    anyhow::ensure!(
+                        self.launch.contains_key(name),
+                        "token {:?} may launch {name:?}, but no such launch preset exists",
+                        token.name
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// (viewer rank, host rank) in the size-precedence order for a token
@@ -252,6 +369,31 @@ impl Config {
     }
 }
 
+/// Read a config file: JSON with `//` and `/* */` comments allowed.
+fn load_config(path: &Path) -> anyhow::Result<Config> {
+    parse_config(&read_config_text(path)?).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn read_config_text(path: &Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read {}; run g2mirror-server --init-config to create it",
+            path.display()
+        )
+    })
+}
+
+fn parse_config(text: &str) -> anyhow::Result<Config> {
+    Ok(serde_json::from_str(&jsonc::strip_comments(text))?)
+}
+
+/// `<cols>x<rows>`, both positive.
+fn parse_preset_size(s: &str) -> bool {
+    s.split_once('x')
+        .and_then(|(c, r)| Some((c.parse::<u16>().ok()?, r.parse::<u16>().ok()?)))
+        .is_some_and(|(c, r)| c > 0 && r > 0)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
@@ -259,7 +401,10 @@ fn main() {
         Some("--add-token") => add_token(&args[1..]),
         Some(other) => {
             eprintln!("unknown argument: {other}");
-            eprintln!("usage: g2mirror-server [--init-config | --add-token <name> [--writable]]");
+            eprintln!(
+                "usage: g2mirror-server [--init-config | --add-token <name> \
+                 [--writable] [--launch <preset>]... [--launch-all]]"
+            );
             std::process::exit(2);
         }
         None => serve(),
@@ -287,24 +432,75 @@ fn init_config() -> anyhow::Result<()> {
         path.display()
     );
     let token = generate_token()?;
-    let config = Config {
-        listen_addr: ListenAddrs::One("127.0.0.1".into()),
-        port: 8737,
-        auth_tokens: vec![TokenConfig {
-            name: "glasses".into(),
-            token_hash: hex(&sha2::Sha256::digest(token.as_bytes())),
-            readonly: false,
-            filter: Vec::new(),
-        }],
-        size_precedence: vec!["glasses".into(), "host".into()],
-        auth_token_hash: None,
-        readonly: None,
-    };
-    std::fs::write(&path, serde_json::to_string_pretty(&config)? + "\n")?;
+    // Seed a "shell" launch preset from the user's login shell and grant
+    // it to the glasses token (the owner's own writable device). The
+    // template is written with comments documenting every option; the
+    // parser accepts // and /* */ comments, and --add-token edits the
+    // file without discarding them.
+    let hash = hex(&sha2::Sha256::digest(token.as_bytes()));
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell = serde_json::to_string(&shell)?; // JSON-quoted
+    let template = format!(
+        r#"{{
+  // Address(es) the websocket gateway listens on: a string or an array of
+  // strings, e.g. ["127.0.0.1", "100.x.y.z"]. Keep these private (loopback
+  // or a tailscale IP); for viewers outside the tailnet, front a loopback
+  // listener with `tailscale funnel` rather than listening publicly (see
+  // README).
+  "listen_addr": "127.0.0.1",
+  "port": 8737,
+
+  // Tokens clients authenticate with; only SHA-256 hashes are stored. Add
+  // more with `g2mirror-server --add-token <name> [--writable]
+  // [--launch <preset>]... [--launch-all]`. Per-token options:
+  //   "readonly": reject all input from this token (default true)
+  //   "filter":   [{{"path": "<regex>"}}, {{"windowtitle": "<regex>"}}, ...]
+  //               only terminals matching some rule are visible to the
+  //               token; within one rule every present field must match,
+  //               and regexes are anchored at both ends
+  //   "launch":   launch presets this token may start: true for all, or a
+  //               list of preset names (requires "readonly": false)
+  "auth_tokens": [
+    {{"name": "glasses", "token_hash": "{hash}",
+     "readonly": false, "launch": true}}
+  ],
+
+  // Who sizes the wrapped app when several clients view it at once: the
+  // earliest listed party that is currently viewing wins ("host" is the
+  // terminal the wrapper runs in, always counted as present). Unlisted
+  // tokens rank below every listed entry; an unlisted host ranks below
+  // those.
+  "size_precedence": ["glasses", "host"],
+
+  // Commands that launch-granted tokens may start as detached sessions
+  // (claim one into a terminal with `g2mirror -a`). A launch request names
+  // a preset; the command line always comes from here, never from the
+  // network. Per-preset options:
+  //   "argv":       command and arguments (required)
+  //   "cwd":        working directory, leading ~ expanded (default "~")
+  //   "title":      initial window title (default: the preset name)
+  //   "env":        {{"VAR": "value"}} merged over the server's environment
+  //   "allow_cwd":  let the launch request override cwd (default false)
+  //   "scrollback": history lines kept for viewers (default 10000)
+  //   "readonly":   reject input to these sessions (default false)
+  //   "size":       initial pty size before a viewer resizes it, e.g.
+  //                 "80x24" (the default)
+  "launch": {{
+    "shell": {{"argv": [{shell}, "-l"], "allow_cwd": true}}
+  }}
+}}
+"#
+    );
+    // Sanity-check our own template before writing it.
+    let config = parse_config(&template).context("generated config template is invalid")?;
+    config.validate_launch()?;
+    std::fs::write(&path, &template)?;
     println!("wrote {}", path.display());
     println!("auth token \"glasses\" (save it now; only the hash is stored):");
     println!("{token}");
     println!();
+    println!("the \"glasses\" token may launch detached login shells (a \"shell\"");
+    println!("launch preset was written; edit the launch section to change this)");
     println!("add tokens for other viewers with: g2mirror-server --add-token <name>");
     println!("start the server by running: g2mirror-server");
     Ok(())
@@ -315,43 +511,78 @@ fn init_config() -> anyhow::Result<()> {
 fn add_token(args: &[String]) -> anyhow::Result<()> {
     let mut name: Option<&str> = None;
     let mut writable = false;
-    for arg in args {
+    let mut launch_all = false;
+    let mut launch_names: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "--writable" => writable = true,
+            "--launch-all" => launch_all = true,
+            "--launch" => match it.next() {
+                Some(preset) => launch_names.push(preset.clone()),
+                None => anyhow::bail!("--launch requires a preset name"),
+            },
             other if !other.starts_with('-') && name.is_none() => name = Some(other),
             other => anyhow::bail!("unexpected argument: {other}"),
         }
     }
     let Some(name) = name else {
-        anyhow::bail!("usage: g2mirror-server --add-token <name> [--writable]");
+        anyhow::bail!(
+            "usage: g2mirror-server --add-token <name> [--writable] \
+             [--launch <preset>]... [--launch-all]"
+        );
     };
     anyhow::ensure!(
         name != "host",
         "\"host\" is reserved (it stands for the host terminal in size_precedence)"
     );
+    let launch = if launch_all {
+        LaunchGrant::Flag(true)
+    } else {
+        LaunchGrant::Named(launch_names)
+    };
+    anyhow::ensure!(
+        launch.is_none() || writable,
+        "a launch grant requires --writable (a read-only token cannot type \
+         into the shells it starts)"
+    );
     let dir = paths::g2mirror_dir()?;
     let path = paths::config_path(&dir);
-    let mut config: Config = serde_json::from_str(
-        &std::fs::read_to_string(&path).with_context(|| {
-            format!(
-                "failed to read {}; run g2mirror-server --init-config to create it",
-                path.display()
-            )
-        })?,
-    )
-    .with_context(|| format!("failed to parse {}", path.display()))?;
+    let text = read_config_text(&path)?;
+    let mut config =
+        parse_config(&text).with_context(|| format!("failed to parse {}", path.display()))?;
     anyhow::ensure!(
         !config.tokens().iter().any(|t| t.name == name),
         "a token named \"{name}\" already exists"
     );
+    if let LaunchGrant::Named(names) = &launch {
+        for preset in names {
+            anyhow::ensure!(
+                config.launch.contains_key(preset),
+                "no launch preset named {preset:?} in the config"
+            );
+        }
+    }
     let token = generate_token()?;
-    config.auth_tokens.push(TokenConfig {
+    let entry = TokenConfig {
         name: name.into(),
         token_hash: hex(&sha2::Sha256::digest(token.as_bytes())),
         readonly: !writable,
         filter: Vec::new(),
-    });
-    std::fs::write(&path, serde_json::to_string_pretty(&config)? + "\n")?;
+        launch,
+    };
+    // Splice the new token into the existing text, so comments in the
+    // config survive; rewrite from the parsed form only for legacy configs
+    // that have no auth_tokens array to splice into.
+    let new_text = match insert_token_text(&text, &entry)? {
+        Some(t) => t,
+        None => {
+            config.auth_tokens.push(entry);
+            serde_json::to_string_pretty(&config)? + "\n"
+        }
+    };
+    parse_config(&new_text).context("edited config failed to re-parse")?;
+    std::fs::write(&path, new_text)?;
     println!("auth token \"{name}\" (save it now; only the hash is stored):");
     println!("{token}");
     println!();
@@ -364,23 +595,119 @@ fn add_token(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Skip a JSON string starting at `i` (which must point at the opening
+/// quote); returns the index just past the closing quote.
+fn skip_string(bytes: &[u8], mut i: usize) -> usize {
+    i += 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// Insert `token` into the top-level `auth_tokens` array of the config
+/// text by splicing, keeping everything else — comments included — byte
+/// for byte. Returns None when the text has no such array (a legacy
+/// config); the caller falls back to a full rewrite. `text` must already
+/// have parsed successfully as a config.
+fn insert_token_text(text: &str, token: &TokenConfig) -> anyhow::Result<Option<String>> {
+    // Comment bytes become spaces at the same offsets, so indices found in
+    // the stripped text are valid in the original.
+    let stripped = jsonc::strip_comments(text);
+    let bytes = stripped.as_bytes();
+
+    // Find the "auth_tokens" key at depth 1 of the top-level object.
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut after_key = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i;
+                i = skip_string(bytes, i);
+                if depth == 1 && &stripped[start..i] == "\"auth_tokens\"" {
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b':') {
+                        after_key = Some(j + 1);
+                        break;
+                    }
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(mut i) = after_key else {
+        return Ok(None);
+    };
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'[') {
+        return Ok(None); // auth_tokens is not an array; let serde complain
+    }
+
+    // Find the matching close bracket and the last element before it.
+    let open = i;
+    let mut depth = 0i32;
+    let close = loop {
+        anyhow::ensure!(i < bytes.len(), "unterminated auth_tokens array");
+        match bytes[i] {
+            b'"' => i = skip_string(bytes, i),
+            b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break i;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    };
+
+    let entry = serde_json::to_string_pretty(token)?.replace('\n', "\n    ");
+    let (at, insert) = match stripped[open + 1..close].rfind(|c: char| !c.is_whitespace()) {
+        // Empty array: the entry becomes its only element.
+        None => (open + 1, format!("\n    {entry}\n  ")),
+        // Splice right after the last element (comments between it and the
+        // bracket stay where they are).
+        Some(off) => (open + 1 + off + 1, format!(",\n    {entry}")),
+    };
+    let mut out = String::with_capacity(text.len() + insert.len());
+    out.push_str(&text[..at]);
+    out.push_str(&insert);
+    out.push_str(&text[at..]);
+    Ok(Some(out))
+}
+
 fn serve() -> anyhow::Result<()> {
     let dir = paths::g2mirror_dir()?;
     let config_file = paths::config_path(&dir);
-    let config: Config = serde_json::from_str(
-        &std::fs::read_to_string(&config_file).with_context(|| {
-            format!(
-                "failed to read {}; run g2mirror-server --init-config to create it",
-                config_file.display()
-            )
-        })?,
-    )
-    .with_context(|| format!("failed to parse {}", config_file.display()))?;
+    let config = load_config(&config_file)?;
     anyhow::ensure!(
         !config.tokens().is_empty(),
         "{} defines no auth tokens; run g2mirror-server --init-config",
         config_file.display()
     );
+    config.validate_launch()?;
     // Compile every token's filter up front so a bad regex fails at
     // startup, not at authentication time.
     let filters: HashMap<String, Vec<CompiledRule>> = config
@@ -550,14 +877,40 @@ async fn run_monitor(path: &Path, name: &str, state: &BellState) -> anyhow::Resu
             continue;
         };
         let event = match msg.get("type").and_then(|t| t.as_str()) {
-            // The connect greeting carries the real working directory,
-            // which token filters match against.
+            // The connect greeting carries the real working directory
+            // (which token filters match against), the current title, and
+            // the detached/launched state.
             Some("connect") => {
+                let mut terminals = state.terminals.lock().unwrap();
+                let terminal = terminals.entry(name.to_string()).or_default();
                 if let Some(cwd) = msg.get("cwd").and_then(|c| c.as_str()) {
-                    let mut terminals = state.terminals.lock().unwrap();
-                    terminals.entry(name.to_string()).or_default().cwd = Some(cwd.to_string());
+                    terminal.cwd = Some(cwd.to_string());
                 }
+                if let Some(title) = msg.get("title").and_then(|t| t.as_str()) {
+                    terminal.title = Some(title.to_string());
+                }
+                terminal.detached = msg
+                    .get("detached")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                terminal.launched = msg
+                    .get("launched")
+                    .and_then(|l| l.as_str())
+                    .map(str::to_string);
                 continue;
+            }
+            // A headless session's host role was claimed or released.
+            Some("host_changed") => {
+                let Some(attached) = msg.get("attached").and_then(serde_json::Value::as_bool)
+                else {
+                    continue;
+                };
+                let mut terminals = state.terminals.lock().unwrap();
+                terminals.entry(name.to_string()).or_default().detached = !attached;
+                ServerToDevice::Detached {
+                    socket: name.to_string(),
+                    detached: !attached,
+                }
             }
             Some("bell") => {
                 let Some(at) = msg.get("at").and_then(serde_json::Value::as_u64) else {
@@ -685,7 +1038,8 @@ async fn handle_device(
                 if let Ok(event) = ev {
                     let socket = match &event {
                         ServerToDevice::Bell { socket, .. }
-                        | ServerToDevice::Title { socket, .. } => Some(socket.clone()),
+                        | ServerToDevice::Title { socket, .. }
+                        | ServerToDevice::Detached { socket, .. } => Some(socket.clone()),
                         _ => None,
                     };
                     match socket {
@@ -790,6 +1144,25 @@ async fn handle_device_message(
                 }
             }
         }
+        Some("launch") => {
+            let preset = parsed
+                .get("command")
+                .and_then(|c| c.as_str())
+                .unwrap_or("shell");
+            let cwd_override = parsed.get("cwd").and_then(|c| c.as_str());
+            match launch_session(config, token, filter, preset, cwd_override).await {
+                Ok(socket) => send(ws, &ServerToDevice::Launched { socket }).await,
+                Err(e) => {
+                    send(
+                        ws,
+                        &ServerToDevice::Error {
+                            message: format!("launch failed: {e:#}"),
+                        },
+                    )
+                    .await
+                }
+            }
+        }
         Some("disconnect") => {
             *session = None;
             send(
@@ -838,6 +1211,103 @@ async fn handle_device_message(
     }
 }
 
+/// Expand a leading `~` to $HOME.
+fn expand_tilde(path: &str) -> String {
+    match (path.strip_prefix("~"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{home}{rest}")
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// The g2mirror wrapper binary: our sibling if present (the normal install
+/// layout), else whatever PATH resolves.
+fn wrapper_exe() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| Some(p.parent()?.join("g2mirror")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("g2mirror"))
+}
+
+/// Start a detached session from a launch preset (a `launch` request).
+/// Returns the new session's socket name.
+///
+/// The heavy lifting is `g2mirror --detached`, which double-spawns: the
+/// invocation we run here forks the actual headless wrapper into its own
+/// session (setsid, so it survives us) and exits immediately, printing the
+/// session socket name — so awaiting it never blocks and leaves no zombie.
+async fn launch_session(
+    config: &Config,
+    token: &TokenConfig,
+    filter: &[CompiledRule],
+    preset_name: &str,
+    cwd_override: Option<&str>,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !token.readonly && token.launch.allows(preset_name),
+        "your token may not launch {preset_name:?}"
+    );
+    let preset = config
+        .launch
+        .get(preset_name)
+        .with_context(|| format!("no launch preset named {preset_name:?}"))?;
+    let cwd = match cwd_override {
+        Some(cwd) => {
+            anyhow::ensure!(
+                preset.allow_cwd,
+                "preset {preset_name:?} does not allow overriding the working directory"
+            );
+            cwd.to_string()
+        }
+        None => preset.cwd.clone().unwrap_or_else(|| "~".into()),
+    };
+    // Canonical form, as the wrapper's getcwd will report it — what token
+    // filters and the socket name are derived from.
+    let cwd = std::fs::canonicalize(expand_tilde(&cwd))
+        .with_context(|| format!("bad working directory {cwd:?}"))?;
+    let title = preset
+        .title
+        .clone()
+        .unwrap_or_else(|| preset_name.to_string());
+    anyhow::ensure!(
+        filter_allows(filter, Some(&cwd.to_string_lossy()), Some(&title)),
+        "your token's filter would hide the launched session"
+    );
+
+    let mut cmd = tokio::process::Command::new(wrapper_exe());
+    cmd.arg("--detached");
+    cmd.arg("--launched").arg(preset_name);
+    cmd.arg("--title").arg(&title);
+    if preset.readonly {
+        cmd.arg("--readonly");
+    }
+    if let Some(lines) = preset.scrollback {
+        cmd.arg("--scrollback").arg(lines.to_string());
+    }
+    if let Some(size) = &preset.size {
+        cmd.arg("--initial-size").arg(size);
+    }
+    cmd.arg("--").args(&preset.argv);
+    cmd.current_dir(&cwd);
+    cmd.envs(&preset.env);
+    cmd.stdin(std::process::Stdio::null());
+    let out = cmd.output().await.context("failed to run g2mirror --detached")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "g2mirror --detached failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let socket = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    anyhow::ensure!(
+        paths::is_valid_socket_name(&socket),
+        "g2mirror --detached printed an unexpected socket name {socket:?}"
+    );
+    eprintln!("launched preset {preset_name:?} for token {:?}: {socket}", token.name);
+    Ok(socket)
+}
+
 /// Session socket names whose file looks valid and whose wrapper PID is
 /// alive.
 fn live_session_sockets(dir: &Path) -> Vec<String> {
@@ -865,6 +1335,8 @@ fn list_sessions(dir: &Path, state: &BellState, filter: &[CompiledRule]) -> Vec<
                 cwd_hint: name.split_once('-').map(|(_, p)| p).unwrap_or("").to_string(),
                 last_bell_at: terminal.last_bell_at,
                 title: terminal.title,
+                detached: terminal.detached,
+                launched: terminal.launched,
                 socket: name,
             }
         })
@@ -1083,6 +1555,73 @@ mod tests {
             .unwrap();
             assert!(compile_filter(&config.tokens()[0]).is_err(), "{filter}");
         }
+    }
+
+    #[test]
+    fn configs_may_contain_comments() {
+        let config: Config = parse_config(
+            r#"{
+              // gateway address
+              "listen_addr": "127.0.0.1", /* and port */ "port": 8737,
+              "auth_tokens": [{"name": "t", "token_hash": "aa"}]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.port, 8737);
+        assert_eq!(config.tokens()[0].name, "t");
+    }
+
+    #[test]
+    fn add_token_splice_preserves_comments() {
+        let token = TokenConfig {
+            name: "rob".into(),
+            token_hash: "bb".into(),
+            readonly: false,
+            filter: Vec::new(),
+            launch: LaunchGrant::Named(vec!["shell".into()]),
+        };
+
+        let text = r#"{
+  // gateway
+  "listen_addr": "127.0.0.1", "port": 1,
+  /* tokens */
+  "auth_tokens": [
+    {"name": "glasses", "token_hash": "aa"} // mine
+  ],
+  "launch": {"shell": {"argv": ["sh"]}}
+}
+"#;
+        let out = insert_token_text(text, &token).unwrap().unwrap();
+        for comment in ["// gateway", "/* tokens */", "// mine"] {
+            assert!(out.contains(comment), "{comment} lost:\n{out}");
+        }
+        let config = parse_config(&out).unwrap();
+        assert_eq!(config.tokens().len(), 2);
+        assert_eq!(config.tokens()[1].name, "rob");
+        assert!(config.tokens()[1].launch.allows("shell"));
+        config.validate_launch().unwrap();
+
+        // An empty array gets the entry as its only element.
+        let text = r#"{"listen_addr": "a", "port": 1, "auth_tokens": []}"#;
+        let out = insert_token_text(text, &token).unwrap().unwrap();
+        let config = parse_config(&out).unwrap();
+        assert_eq!(config.tokens()[0].name, "rob");
+
+        // Strings full of brackets, comment markers, and the key's own
+        // name must not derail the scan.
+        let text = r#"{
+  "listen_addr": "a", "port": 1,
+  "auth_tokens": [
+    {"name": "g", "token_hash": "aa",
+     "filter": [{"windowtitle": "x /* ] \" auth_tokens // ["}]}
+  ]
+}"#;
+        let out = insert_token_text(text, &token).unwrap().unwrap();
+        assert_eq!(parse_config(&out).unwrap().tokens().len(), 2);
+
+        // Legacy configs without an auth_tokens array have no splice point.
+        let text = r#"{"listen_addr": "a", "port": 1, "auth_token_hash": "aa"}"#;
+        assert!(insert_token_text(text, &token).unwrap().is_none());
     }
 
     #[test]

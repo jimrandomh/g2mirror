@@ -37,6 +37,18 @@ pub enum ToSession {
         /// host ranks below every viewer (the pre-precedence behavior).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host_size_rank: Option<u32>,
+        /// `host` claims the host role on a headless (detached) session:
+        /// this client's size ranks as `"host"` in the size precedence
+        /// instead of by token, and the session stops counting as
+        /// detached. At most one client holds the role; refused on
+        /// sessions with a real host terminal.
+        #[serde(default, skip_serializing_if = "Role::is_viewer")]
+        role: Role,
+        /// With `role: host`: take the role over from a client that
+        /// already holds it (which is disconnected) instead of being
+        /// refused.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
     /// Alternative first message: this connection is a monitor (normally
     /// g2mirror-server). It receives bell notifications and does not count
@@ -71,6 +83,29 @@ pub enum ToSession {
     /// index `before`. Paginate backwards by passing the previous reply's
     /// `start` as the next `before`.
     History { before: u64, limit: Option<u32> },
+    /// This client's terminal was resized: update the dimensions it
+    /// declared in `init` (host-role clients forward SIGWINCH this way).
+    /// If the client currently controls the view size, the stream restarts
+    /// at the new dimensions and every viewer gets a fresh snapshot.
+    Resize { width: u16, height: u16 },
+}
+
+/// A session client's role, declared in `init`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// A device or human viewer; its size ranks by its token.
+    #[default]
+    Viewer,
+    /// The claimant of a detached session's host slot (`g2mirror --attach`).
+    Host,
+}
+
+impl Role {
+    /// serde skip helper: the default role is omitted on the wire.
+    pub fn is_viewer(&self) -> bool {
+        *self == Role::Viewer
+    }
 }
 
 /// Session protocol: wrapper -> client.
@@ -90,6 +125,23 @@ pub enum FromSession {
         readonly: bool,
         /// Extent of the scrollback history archive.
         history: HistoryExtent,
+        /// Current window title, if one is set (also pushed as a `title`
+        /// message on change; carried here so a one-shot probe of the
+        /// socket sees it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// True for a wrapper running without a host terminal
+        /// (`--headless`/`--detached`). Only headless sessions accept
+        /// host-role inits.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        headless: bool,
+        /// True when the session is headless and no client currently holds
+        /// the host role — i.e. it is claimable with `g2mirror --attach`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        detached: bool,
+        /// The server launch preset this session was started from, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launched: Option<String>,
     },
     /// Full repaint of the mirrored screen; sent on view, and re-sent to
     /// every viewing client whenever the stream's dimensions change (a
@@ -118,6 +170,9 @@ pub enum FromSession {
     Title { title: String },
     /// The wrapped app exited. The connection closes after this.
     Exit { status: Option<i32> },
+    /// A headless session's host role was claimed or released (sent to the
+    /// monitor and viewers, like `title`): its detached state flipped.
+    HostChanged { attached: bool },
     /// Reply to a history request: lines `start..start+lines.len()` in
     /// oldest-to-newest order, plus the current archive extent.
     HistoryLines {
@@ -184,6 +239,12 @@ pub enum ServerToDevice {
     Init { version: u32, readonly: bool },
     /// Reply to `list`.
     Sessions { sessions: Vec<SessionInfo> },
+    /// Reply to `launch`: the new session's socket name; follow with a
+    /// normal `connect` to attach to it.
+    Launched { socket: String },
+    /// A terminal's detached state changed (host role claimed or released;
+    /// sent to every connected device, like `title`).
+    Detached { socket: String, detached: bool },
     /// The session connection ended (wrapper exited, `disconnect` requested,
     /// or an I/O error occurred).
     Disconnected { reason: String },
@@ -208,6 +269,13 @@ pub struct SessionInfo {
     pub last_bell_at: Option<u64>,
     /// The terminal's window title, if the app has set one.
     pub title: Option<String>,
+    /// True when the session is headless with no host-role client: it can
+    /// be claimed with `g2mirror --attach`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
+    /// The server launch preset the session was started from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched: Option<String>,
 }
 
 pub fn encode_terminal_bytes(bytes: &[u8]) -> String {

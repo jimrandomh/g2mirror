@@ -746,3 +746,227 @@ fn now_ms() -> u64 {
         .unwrap()
         .as_millis() as u64
 }
+
+/// Wait for a wrapper's session socket file to appear.
+async fn wait_socket(dir: &std::path::Path, pid: u32) -> PathBuf {
+    for _ in 0..250 {
+        if let Some(entry) = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with(&format!("{pid}-")))
+        {
+            return entry.path();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("session socket never appeared");
+}
+
+/// Connect to a session socket and read the connect greeting.
+async fn connect_session(
+    socket: &std::path::Path,
+) -> (
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+    tokio::net::unix::OwnedWriteHalf,
+    Value,
+) {
+    let stream = UnixStream::connect(socket).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let greeting = read_msg(&mut reader).await;
+    assert_eq!(greeting["type"], "connect");
+    (reader, write_half, greeting)
+}
+
+async fn send_msg(write_half: &mut tokio::net::unix::OwnedWriteHalf, msg: Value) {
+    write_half
+        .write_all((msg.to_string() + "\n").as_bytes())
+        .await
+        .unwrap();
+}
+
+/// Read messages until one of the given type arrives (skipping others).
+async fn read_until_type(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    msg_type: &str,
+) -> Value {
+    loop {
+        let msg = read_msg(reader).await;
+        if msg["type"] == msg_type {
+            return msg;
+        }
+    }
+}
+
+#[tokio::test]
+async fn headless_host_role_claim_force_and_resize() {
+    let dir = test_dir("headless");
+    let mut _wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args([
+            "--headless", "--initial-size", "80x24", "--title", "det-title",
+            "--launched", "shellx", "--", "sh", "-c", "printf 'hl-ready\\n'; cat",
+        ])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = _wrapper.id().unwrap();
+    let socket = wait_socket(&dir, pid).await;
+
+    // Monitor: the greeting reports the headless/detached state, the title,
+    // and the launch preset; host dimensions are the initial size.
+    let (mut mon_reader, mut mon_write, greeting) = connect_session(&socket).await;
+    assert_eq!(greeting["headless"], true);
+    assert_eq!(greeting["detached"], true);
+    assert_eq!(greeting["title"], "det-title");
+    assert_eq!(greeting["launched"], "shellx");
+    assert_eq!(greeting["host_width"], 80);
+    assert_eq!(greeting["host_height"], 24);
+    send_msg(&mut mon_write, json!({"type": "monitor", "version": 1})).await;
+
+    // A claims the host role at 100x30 and views: the stream runs at A's
+    // size (there is no physical host), and the monitor hears the claim.
+    let (mut a_reader, mut a_write, greeting) = connect_session(&socket).await;
+    assert_eq!(greeting["detached"], true);
+    send_msg(&mut a_write, json!({
+        "type": "init", "version": 1, "device": "attach-A",
+        "width": 100, "height": 30, "role": "host",
+    })).await;
+    send_msg(&mut a_write, json!({"type": "view"})).await;
+    let snapshot = read_until_type(&mut a_reader, "snapshot").await;
+    assert_eq!(snapshot["width"], 100);
+    assert_eq!(snapshot["height"], 30);
+    let changed = read_until_type(&mut mon_reader, "host_changed").await;
+    assert_eq!(changed["attached"], true);
+
+    // B: the session no longer reads as detached, and a second host-role
+    // init without force is refused.
+    let (mut b_reader, mut b_write, greeting) = connect_session(&socket).await;
+    assert_eq!(greeting["headless"], true);
+    assert_eq!(greeting["detached"], Value::Null, "claimed session must not be detached");
+    send_msg(&mut b_write, json!({
+        "type": "init", "version": 1, "device": "attach-B",
+        "width": 80, "height": 24, "role": "host",
+    })).await;
+    let err = read_until_type(&mut b_reader, "error").await;
+    assert!(
+        err["message"].as_str().unwrap().contains("already attached"),
+        "unexpected error: {err}"
+    );
+
+    // C takes the role over with force: A is told and dropped; C's view
+    // restarts the stream at C's size.
+    let (mut c_reader, mut c_write, _) = connect_session(&socket).await;
+    send_msg(&mut c_write, json!({
+        "type": "init", "version": 1, "device": "attach-C",
+        "width": 96, "height": 26, "role": "host", "force": true,
+    })).await;
+    let err = read_until_type(&mut a_reader, "error").await;
+    assert!(
+        err["message"].as_str().unwrap().contains("taken over"),
+        "unexpected error: {err}"
+    );
+    send_msg(&mut c_write, json!({"type": "view"})).await;
+    let snapshot = read_until_type(&mut c_reader, "snapshot").await;
+    assert_eq!(snapshot["width"], 96);
+    assert_eq!(snapshot["height"], 26);
+
+    // C's terminal resizes: the resize message restarts the stream at the
+    // new dimensions.
+    send_msg(&mut c_write, json!({"type": "resize", "width": 90, "height": 28})).await;
+    let snapshot = read_until_type(&mut c_reader, "snapshot").await;
+    assert_eq!(snapshot["width"], 90);
+    assert_eq!(snapshot["height"], 28);
+
+    // C disconnects: the session is detached again.
+    drop(c_reader);
+    drop(c_write);
+    let changed = read_until_type(&mut mon_reader, "host_changed").await;
+    assert_eq!(changed["attached"], false);
+    let (_r, _w, greeting) = connect_session(&socket).await;
+    assert_eq!(greeting["detached"], true);
+}
+
+#[tokio::test]
+async fn headless_session_keeps_pty_size_when_nobody_views() {
+    let dir = test_dir("keepsize");
+    let mut _wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["--headless", "--initial-size", "80x24", "--", "sh"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket = wait_socket(&dir, _wrapper.id().unwrap()).await;
+
+    let (mut reader, mut write, _) = connect_session(&socket).await;
+    send_msg(&mut write, json!({
+        "type": "init", "version": 1, "device": "A", "width": 100, "height": 30,
+    })).await;
+    send_msg(&mut write, json!({"type": "view"})).await;
+    read_until_type(&mut reader, "snapshot").await;
+
+    // Stop viewing; the pty must stay at 100x30 rather than snapping back
+    // to the initial size — stty, run while nobody views, reports it.
+    send_msg(&mut write, json!({"type": "unview"})).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send_msg(&mut write, json!({
+        "type": "input",
+        "data": base64_encode(b"stty size\n"),
+    })).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    send_msg(&mut write, json!({"type": "view"})).await;
+    let snapshot = read_until_type(&mut reader, "snapshot").await;
+    assert_eq!(snapshot["width"], 100);
+    let mut device = vt100::Parser::new(30, 100, 0);
+    device.process(&base64_decode(snapshot["data"].as_str().unwrap()));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !device.screen().contents().contains("30 100") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stty never reported the kept size; screen:\n{}",
+            device.screen().contents()
+        );
+        let msg = read_msg(&mut reader).await;
+        if msg["type"] == "output" {
+            device.process(&base64_decode(msg["data"].as_str().unwrap()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_role_refused_on_hosted_session() {
+    let dir = test_dir("hostref");
+    let mut _wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args(["sh", "-c", "cat"])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket = wait_socket(&dir, _wrapper.id().unwrap()).await;
+
+    let (mut reader, mut write, greeting) = connect_session(&socket).await;
+    assert_eq!(greeting["headless"], Value::Null);
+    assert_eq!(greeting["detached"], Value::Null);
+    send_msg(&mut write, json!({
+        "type": "init", "version": 1, "device": "A",
+        "width": 80, "height": 24, "role": "host",
+    })).await;
+    let err = read_until_type(&mut reader, "error").await;
+    assert!(
+        err["message"].as_str().unwrap().contains("real host terminal"),
+        "unexpected error: {err}"
+    );
+}

@@ -17,10 +17,17 @@ truncated.
   `~/.g2mirror/<pid>-<cwd>` speaking newline-delimited JSON; a client can
   ask to `view` (resize the app to the device size, get a snapshot, then a
   live output stream) and `unview`. **Ctrl+G** simulates a glasses
-  connect/disconnect at 96×24 without a real client.
+  connect/disconnect at 96×24 without a real client. It is also the CLI
+  for detached sessions: `g2mirror --detached <command>` starts one
+  without a terminal, `g2mirror -l` lists sessions, and `g2mirror -a`
+  claims a detached session into the current terminal (see "Launching
+  shells and detached sessions" below).
 - **`g2mirror-server`** — a websocket gateway for device drivers. Reads
   `~/.g2mirror/config.json` (create it with `g2mirror-server
-  --init-config`, which prints the first auth token once), cleans up stale
+  --init-config`, which prints the first auth token once and writes a
+  template with every option documented in comments — the config is JSON
+  with `//` and `/* */` comments allowed, and `--add-token` edits keep
+  them), cleans up stale
   session sockets, authenticates devices, lists sessions, and relays
   messages. It listens on a private address (loopback by default);
   encryption is delegated to tailscale or an ssh tunnel. It also keeps a
@@ -93,6 +100,66 @@ repaints (in g2mirror-view and on the wrapper's host terminal alike; the
 keystroke is still forwarded to the app, so a shell's usual Ctrl+L
 behavior is preserved).
 
+## Launching shells and detached sessions
+
+A device can start a new shell or command on the laptop — without any
+pre-existing terminal — if its token is allowed to. What it may start is
+pinned down by named **launch presets** in the config; the wire can only
+pick a preset by name, never supply a command line:
+
+```json
+"launch": {
+  "shell":  { "argv": ["/bin/zsh", "-l"], "allow_cwd": true },
+  "watch":  { "argv": ["make", "watch"], "cwd": "~/repositories/proj",
+              "title": "build watcher", "readonly": true }
+}
+```
+
+Per-preset fields: `argv` (required), `cwd` (default `~`, `~` expanded),
+`title` (default: the preset name), `env` (merged over the server's),
+`allow_cwd` (may the request override `cwd` — e.g. "open a shell in the
+directory of the terminal I'm viewing"; default false), `scrollback`,
+`readonly`, and `size` (initial pty size like `"80x24"`, until a viewer
+resizes it). Tokens opt in with `"launch": true` (any preset) or
+`"launch": ["shell", "watch"]`; the default is no launching. **A launch
+grant is remote code execution by design** — give it only to tokens you'd
+hand a shell. It also requires the token to be writable; a read-only
+token with a launch grant is rejected at startup as a contradiction, as
+is a grant naming a preset that doesn't exist. `--init-config` seeds a
+`"shell"` preset from `$SHELL` and grants it to the glasses token;
+`--add-token <name> --writable --launch shell` (repeatable, or
+`--launch-all`) grants launching to new tokens.
+
+Launched sessions are **headless**: no terminal shows them, they are
+sized by their viewers (keeping their last size when the glasses look
+away, rather than reflowing), and they keep running when every client
+disconnects. While no one holds their *host role* they are **detached** —
+marked in session lists and claimable from the laptop:
+
+```sh
+g2mirror -l               # list sessions; detached ones first, marked DETACHED
+g2mirror -a               # claim: attaches immediately if exactly one is detached
+g2mirror -a claude        # pattern matches pid, title, cwd, command, or preset
+```
+
+The intended flow is "open a fresh tmux/screen tab, run `g2mirror -a`":
+recent scrollback prints into the tab's own history, the live viewport
+mirrors bottom-anchored (all the size-mismatch handling above applies),
+every key is forwarded, and the claimed terminal's size occupies the
+`"host"` slot of `size_precedence` — so the glasses still win the app's
+size if ranked above `"host"`, and the tab follows along. **Ctrl+\\**
+detaches, leaving the session running (`--detach-key ctrl-x`/`none`
+changes it; ^D is forwarded to the shell, unlike in g2mirror-view). If
+several sessions match, a small picker opens; `--force` takes the host
+role over from another attach client (e.g. a tab you lost over ssh).
+When the wrapped command exits, the attach client exits with its status.
+
+`g2mirror --detached [--title …] -- <command>` starts a detached session
+from the laptop side (it prints the socket name and pid) — handy for
+kicking off long jobs to watch from the glasses later. Attaching to
+sessions that have a real host terminal is refused; that's what
+g2mirror-view is for.
+
 ## Build & run
 
 ```sh
@@ -105,6 +172,10 @@ cargo build
 ./target/debug/g2mirror-server                 # ws://127.0.0.1:8737
 
 ./target/debug/g2mirror-view "g2mirror://<token>@127.0.0.1:8737"
+
+./target/debug/g2mirror --detached -- make watch   # headless session
+./target/debug/g2mirror -l                         # list; DETACHED marks claimable
+./target/debug/g2mirror -a watch                   # claim it into this terminal
 ```
 
 ## Exposing to coworkers with tailscale funnel
@@ -156,7 +227,10 @@ and the full device→server→wrapper chain.
 
 ## Layout
 
-- `src/main.rs` — wrapper: pty + child spawn, raw mode, event loop
+- `src/main.rs` — wrapper: pty + child spawn, raw mode, event loop,
+  headless/detached modes
+- `src/attach.rs` — `--list`/`--attach`: session probing, the picker, and
+  the attach client (a host-role viewer over the session socket)
 - `src/control.rs` — session socket listener/client framing
 - `src/lib.rs` etc. — shared library: `mirror` (view state machine and
   vt100-based output translation, also used by the viewer for its local
