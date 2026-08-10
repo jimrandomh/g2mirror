@@ -236,7 +236,17 @@ pub enum ServerToDevice {
     /// additionally be read-only via the wrapper's --readonly flag,
     /// reported in its connect message; input works only when neither is
     /// set.)
-    Init { version: u32, readonly: bool },
+    Init {
+        version: u32,
+        readonly: bool,
+        /// Human-readable name of the machine the server runs on (the
+        /// config's `server_name`, defaulting to the OS hostname), so a
+        /// client that dialed a nondescript address (e.g. a tailscale IP)
+        /// can label the connection for its user. Absent from older
+        /// servers.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        server_name: String,
+    },
     /// Reply to `list`.
     Sessions { sessions: Vec<SessionInfo> },
     /// Reply to `launch`: the new session's socket name; follow with a

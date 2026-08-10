@@ -273,6 +273,11 @@ struct Config {
     /// on 0.0.0.0/::.
     listen_addr: ListenAddrs,
     port: u16,
+    /// Human-readable name for this machine, sent to clients in the init
+    /// reply so they can label a connection made to a nondescriptive
+    /// address (e.g. a tailscale IP). Default: the OS hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_name: Option<String>,
     /// Tokens accepted for authentication. Manage with `--add-token`.
     #[serde(default)]
     auth_tokens: Vec<TokenConfig>,
@@ -300,6 +305,14 @@ struct Config {
 }
 
 impl Config {
+    /// The name sent to clients in the init reply: the config's
+    /// `server_name`, or the OS hostname when unset.
+    fn server_name(&self) -> String {
+        self.server_name
+            .clone()
+            .unwrap_or_else(|| rustix::system::uname().nodename().to_string_lossy().into_owned())
+    }
+
     /// All accepted tokens, with the legacy single-token fields folded in.
     fn tokens(&self) -> Vec<TokenConfig> {
         let mut tokens = self.auth_tokens.clone();
@@ -449,6 +462,11 @@ fn init_config() -> anyhow::Result<()> {
   // README).
   "listen_addr": "127.0.0.1",
   "port": 8737,
+
+  // Name clients show their users to identify this machine (the address
+  // they dialed may be a nondescriptive tailscale IP). Uncomment to
+  // override the default, which is the OS hostname.
+  // "server_name": "jims-laptop",
 
   // Tokens clients authenticate with; only SHA-256 hashes are stored. Add
   // more with `g2mirror-server --add-token <name> [--writable]
@@ -982,6 +1000,7 @@ async fn authenticate_device(
         &ServerToDevice::Init {
             version: PROTOCOL_VERSION,
             readonly: token.readonly,
+            server_name: config.server_name(),
         },
     )
     .await?;

@@ -146,6 +146,8 @@ enum Mode {
 struct App {
     stdout: tokio::io::Stdout,
     addr: String,
+    /// The server's machine name from the init reply, if it sent one.
+    server_name: Option<String>,
     rows: u16,
     cols: u16,
     /// The dimensions declared in our init, fixed for the connection.
@@ -195,11 +197,19 @@ async fn run(token: String, url: String) -> anyhow::Result<()> {
             reply.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error")
         ),
     };
+    // Descriptive machine name (absent from older servers), so the header
+    // says more than the possibly-nondescriptive address we dialed.
+    let server_name = reply
+        .get("server_name")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
 
     let _raw = RawGuard::new().context("failed to enter raw mode")?;
     let mut app = App {
         stdout: tokio::io::stdout(),
         addr: url,
+        server_name,
         rows,
         cols,
         init_rows: rows,
@@ -690,8 +700,12 @@ impl App {
             return Ok(());
         }
         let readonly = if self.token_readonly { " (read-only)" } else { "" };
+        let server = match &self.server_name {
+            Some(name) => format!("{name} ({})", self.addr),
+            None => self.addr.clone(),
+        };
         let mut lines = vec![
-            format!("g2mirror-view \u{2014} {}{}", self.addr, readonly),
+            format!("g2mirror-view \u{2014} {server}{readonly}"),
             self.status.clone(),
             String::new(),
         ];

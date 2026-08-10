@@ -120,6 +120,11 @@ async fn server_auth_list_connect_and_relay() {
     assert_eq!(reply["type"], "init");
     assert_eq!(reply["version"], 1);
     assert_eq!(reply["readonly"], false);
+    // No server_name in the config: the OS hostname is sent.
+    assert!(
+        !reply["server_name"].as_str().unwrap().is_empty(),
+        "init reply must carry a server_name"
+    );
 
     // List shows the fake session.
     send(&mut ws, json!({"type": "list"})).await;
@@ -252,6 +257,7 @@ async fn multiple_tokens_have_separate_readonly_flags_and_size_ranks() {
         dir.join("config.json"),
         json!({
             "listen_addr": "127.0.0.1", "port": 0,
+            "server_name": "test-box",
             "auth_tokens": [
                 {"name": "glasses", "token_hash": sha256_hex("g-token"), "readonly": false},
                 {"name": "spectator", "token_hash": sha256_hex("s-token")}
@@ -275,6 +281,8 @@ async fn multiple_tokens_have_separate_readonly_flags_and_size_ranks() {
     let (mut spectator, reply) = connect_device(&addr, "s-token").await;
     assert_eq!(reply["type"], "init");
     assert_eq!(reply["readonly"], true);
+    // A configured server_name overrides the OS-hostname default.
+    assert_eq!(reply["server_name"], "test-box");
     send(&mut spectator, json!({"type": "input", "data": "aGkNCg=="})).await;
     let reply = recv(&mut spectator).await;
     assert_eq!(reply["type"], "error");

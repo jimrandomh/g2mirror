@@ -11,7 +11,7 @@ getrandom = "0.4.3"
 pty-process = { version = "0.5.3", features = ["async"] }
 regex = "1.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-rustix = { version = "1.1.4", features = ["termios", "stdio", "process"] }
+rustix = { version = "1.1.4", features = ["termios", "stdio", "process", "system"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"

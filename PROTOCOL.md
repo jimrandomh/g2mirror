@@ -85,8 +85,15 @@ The device's **first** message must be `init`:
 Success reply:
 
 ```json
-{"type": "init", "version": 1, "readonly": false}
+{"type": "init", "version": 1, "readonly": false,
+ "server_name": "jims-laptop"}
 ```
+
+`server_name` is a human-readable name for the machine the server runs on
+(the `server_name` value in the server config, defaulting to the OS
+hostname). Display it to identify the connection: the address the device
+dialed is often nondescriptive (a tailscale IP, a funnel hostname). Older
+servers omit the field.
 
 `readonly` reflects the authenticated token's flag in the server config:
 when true, the server rejects every `input` message itself. A session can
