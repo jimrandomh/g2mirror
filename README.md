@@ -1,6 +1,9 @@
 # g2mirror
 
-Mirror terminal programs to Even Realities G2 smart glasses.
+Mirror terminal programs to Even Realities G2 smart glasses. This is designed
+to work with the Terminal app inside
+[Faceclaw](https://github.com/jimrandomh/faceclaw); it does not currently have
+a client compatible with the stock Even G2 firmware.
 
 `g2mirror <command> [args...]` runs the command in a pseudoterminal. While
 the glasses are connected and viewing the terminal, the wrapped app is
