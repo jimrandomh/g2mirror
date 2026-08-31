@@ -142,6 +142,12 @@ pub enum FromSession {
         /// The server launch preset this session was started from, if any.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launched: Option<String>,
+        /// When the wrapped app last wrote output (unix epoch ms), if it
+        /// has since the wrapper started (also pushed as `activity`
+        /// messages; carried here so a fresh monitor or a one-shot probe
+        /// sees the recency).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_output_at: Option<u64>,
     },
     /// Full repaint of the mirrored screen; sent on view, and re-sent to
     /// every viewing client whenever the stream's dimensions change (a
@@ -165,6 +171,13 @@ pub enum FromSession {
     /// per 3 seconds (a bell suppressed by the debounce window is reported
     /// when the window expires, so the latest timestamp is not lost).
     Bell { at: u64 },
+    /// Sent to monitor connections when the wrapped app writes output.
+    /// `at` is unix epoch milliseconds; rate-limited to at most one
+    /// message per 2 seconds (leading edge only — an app producing
+    /// continuous output yields a message roughly every 2 seconds, and a
+    /// quiet app yields none, so "output within the last few seconds" is
+    /// a usable activity indicator).
+    Activity { at: u64 },
     /// The app set the window title (xterm OSC 0/2). Sent to the monitor
     /// and the viewer on change, and once on attach if a title is set.
     Title { title: String },
@@ -261,6 +274,11 @@ pub enum ServerToDevice {
     /// A terminal rang its bell (sent to every connected device, whether or
     /// not it is viewing that terminal). `last_bell_at` is unix epoch ms.
     Bell { socket: String, last_bell_at: u64 },
+    /// A terminal's app wrote output (sent to every connected device,
+    /// whether or not it is viewing that terminal; rate-limited by the
+    /// wrapper to at most one per 2 seconds per terminal). `last_output_at`
+    /// is unix epoch ms.
+    Activity { socket: String, last_output_at: u64 },
     /// A terminal's window title changed (sent to every connected device,
     /// whether or not it is viewing that terminal).
     Title { socket: String, title: String },
@@ -277,6 +295,10 @@ pub struct SessionInfo {
     /// When this terminal's bell last rang (unix epoch ms), if it has rung
     /// since the server started monitoring the terminal.
     pub last_bell_at: Option<u64>,
+    /// When this terminal's app last wrote output (unix epoch ms), if it
+    /// has since the server started monitoring the terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<u64>,
     /// The terminal's window title, if the app has set one.
     pub title: Option<String>,
     /// True when the session is headless with no host-role client: it can

@@ -37,7 +37,9 @@ truncated.
   monitor connection to every session and tracks each terminal's last
   bell, pushing debounced bell notifications to connected devices — useful
   for watching AI agents and other long-running programs that ring the
-  terminal bell (`printf '\a'`) when they want attention.
+  terminal bell (`printf '\a'`) when they want attention. It likewise
+  tracks each terminal's last output, pushing rate-limited activity
+  notifications so devices can show which terminals are actively busy.
 - **`g2mirror-view`** — a terminal client for humans without glasses
   (e.g. a coworker following a shared project). `g2mirror-view
   g2mirror://<token>@<host>[:port]` shows the list of live terminals
@@ -74,7 +76,7 @@ A terminal is visible when **any** rule matches; within one rule every
 present field must match. `path` is matched against the session's real
 working directory and `windowtitle` against its current title; both are
 regexes anchored at both ends. Filters govern everything: hidden terminals
-are absent from `list`, refuse `connect`, and produce no bell/title
+are absent from `list`, refuse `connect`, and produce no bell/activity/title
 notifications — and since a title change can toggle visibility (handy as
 an on/off switch: have the program or your prompt set a title containing a
 marker like `SHARED`), a viewer attached to a terminal that stops matching

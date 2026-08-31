@@ -195,12 +195,15 @@ async fn monitor_gets_debounced_bells_and_does_not_block_viewers() {
     assert_eq!(title["type"], "title");
     assert_eq!(title["title"], "agent busy");
 
-    // The first bell arrives promptly with a plausible timestamp.
+    // The first bell arrives promptly with a plausible timestamp. The BEL
+    // byte is also pty output, so an activity report follows it.
     let before = now_ms();
     let bell = read_msg(&mut monitor).await;
     assert_eq!(bell["type"], "bell");
     let at = bell["at"].as_u64().unwrap();
     assert!(at >= before && at <= now_ms() + 1000, "bell at {at} out of range");
+    let activity = read_msg(&mut monitor).await;
+    assert_eq!(activity["type"], "activity");
 
     // The second bell (inside the window) is debounced: nothing for ~1s.
     let mut line = String::new();
@@ -230,6 +233,84 @@ async fn monitor_gets_debounced_bells_and_does_not_block_viewers() {
     let trailing = read_msg(&mut monitor).await;
     assert_eq!(trailing["type"], "bell");
     assert!(trailing["at"].as_u64().unwrap() >= at);
+
+    wrapper.kill().await.ok();
+}
+
+#[tokio::test]
+async fn monitor_gets_rate_limited_activity_reports() {
+    let dir = test_dir("act");
+    let mut wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args([
+            "sh",
+            "-c",
+            // Output before the monitor attaches (only the connect
+            // greeting's last_output_at sees it), then a burst of two
+            // writes 300ms apart (leading-edge report + suppressed), then
+            // a write after the 2s reporting interval (reported again).
+            "printf 'one\\n'; sleep 0.5; printf 'two\\n'; sleep 0.3; \
+             printf 'three\\n'; sleep 2.2; printf 'four\\n'; sleep 1",
+        ])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let wrapper_pid = wrapper.id().unwrap();
+
+    let socket_path = {
+        let mut found = None;
+        for _ in 0..100 {
+            if let Some(entry) = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .find(|e| e.file_name().to_string_lossy().starts_with(&format!("{wrapper_pid}-")))
+            {
+                found = Some(entry.path());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        found.expect("session socket never appeared")
+    };
+
+    // The socket exists before the child's first write; give the "one"
+    // printf time to land so the greeting reflects it (well inside the
+    // child's 500ms pause before "two").
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut monitor = BufReader::new(read_half);
+
+    // The greeting carries the recency of the pre-attach output.
+    let connect = read_msg(&mut monitor).await;
+    assert_eq!(connect["type"], "connect");
+    let greeted_at = connect["last_output_at"].as_u64()
+        .expect("connect greeting must carry last_output_at after output");
+    assert!(greeted_at <= now_ms() + 1000, "last_output_at {greeted_at} in the future");
+    write_half
+        .write_all(b"{\"type\":\"monitor\",\"version\":1}\n")
+        .await
+        .unwrap();
+
+    // The first post-attach output reports immediately (leading edge)...
+    let first = read_msg(&mut monitor).await;
+    assert_eq!(first["type"], "activity");
+    let first_at = first["at"].as_u64().unwrap();
+    assert!(first_at >= greeted_at, "activity at {first_at} predates the greeting");
+
+    // ...the write inside the reporting interval is suppressed...
+    let mut line = String::new();
+    let quiet = tokio::time::timeout(Duration::from_secs(1), monitor.read_line(&mut line)).await;
+    assert!(quiet.is_err(), "activity inside the interval was not suppressed: {line}");
+
+    // ...and output after the interval reports again.
+    let second = read_msg(&mut monitor).await;
+    assert_eq!(second["type"], "activity");
+    assert!(second["at"].as_u64().unwrap() >= first_at);
 
     wrapper.kill().await.ok();
 }

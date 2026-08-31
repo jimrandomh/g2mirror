@@ -115,21 +115,27 @@ Failure reply (`error`), then the server closes the connection:
 {"type": "sessions", "sessions": [
   {"socket": "84210-_Users_jim_repos_myproj", "pid": 84210,
    "cwd_hint": "_Users_jim_repos_myproj", "last_bell_at": 1782264921042,
+   "last_output_at": 1782264923511,
    "title": "vim notes.md", "detached": true, "launched": "shell"}
 ]}
 ```
 
 `socket` is an opaque handle to pass to `connect`. `cwd_hint` is the
 sanitized working directory — display it to help the user pick a session.
-`last_bell_at` is when that terminal's bell last rang (unix epoch ms), and
+`last_bell_at` is when that terminal's bell last rang (unix epoch ms),
+`last_output_at` is when its app last wrote output (unix epoch ms, fresh
+to within the wrapper's 2-second activity reporting interval — see the
+`activity` notification below), and
 `title` is the window title the app last set (xterm OSC 0/2, e.g. what
 would appear in a terminal emulator's title bar — often the running command
 or an agent's status line); until the app sets one it is the wrapper's
-`--title` value, if that was given. Either is `null` if the event hasn't happened
+`--title` value, if that was given. Each is `null`/absent if the event hasn't happened
 since the server began monitoring the terminal (the server monitors every
 terminal from the moment it discovers its socket, whether or not any device
 is attached; it does not know about bells or titles from before then or
-while the server was down). `detached` (absent means false) marks a
+while the server was down — though `last_output_at` is additionally seeded
+from the wrapper's connect greeting, so output from before the server
+started monitoring is still reflected). `detached` (absent means false) marks a
 headless session nobody currently holds the host role of — one the user
 can claim into a terminal with `g2mirror --attach` — and `launched` names
 the launch preset it was started from, if any (both absent for ordinary
@@ -183,6 +189,23 @@ catches up to the latest bell. Use this to surface "an agent wants
 attention" cues on the glasses; ring the bell in the wrapped program
 (`printf '\a'`) to trigger it.
 
+Whenever a monitored terminal's app writes output — any pty bytes at all,
+attached or not, viewed or not — every authenticated device receives:
+
+```json
+{"type": "activity", "socket": "84210-_Users_jim_repos_myproj",
+ "last_output_at": 1782264923511}
+```
+
+Activity notifications for one terminal are rate-limited by its wrapper to
+at most one every 2 seconds, leading edge only: an app producing continuous
+output yields a message roughly every 2 seconds, and the messages stop as
+soon as the output does (there is no trailing report — unlike bells, a
+suppressed activity report is not a lost event, since the next output
+re-reports). Treat "an activity message within the last ~5 seconds" as
+"this terminal is actively producing output" — e.g. to animate a busy
+indicator in a session list.
+
 Likewise, whenever a terminal app sets its window title (xterm OSC 0 or
 OSC 2, BEL- or ST-terminated), every authenticated device receives:
 
@@ -224,7 +247,10 @@ A connection's first message determines its role: `init` makes it a
 `{"type": "monitor", "version": 1}`
 makes it a **monitor** — a role used by g2mirror-server to receive
 `{"type": "bell", "at": <unix ms>}` notifications (debounced to one per 3s,
-trailing bell reported when the window expires). A monitor does not count as
+trailing bell reported when the window expires) and
+`{"type": "activity", "at": <unix ms>}` notifications whenever the wrapped
+app writes output (rate-limited to one per 2s, leading edge only — reports
+stop as soon as the output does). A monitor does not count as
 a viewer: it cannot send `view`/`unview` and does not block a device from
 attaching. Drivers talk through the server and never need the monitor role
 themselves; it is documented here for completeness.
@@ -287,11 +313,14 @@ wrapper was started with `--readonly` and will reject `input`. `history`
 is the scrollback archive extent (see "Scrollback history" below).
 `title` is the current window title if one is set (also pushed as `title`
 messages on change; carried here so one-shot probes of the socket, like
-`g2mirror --list`, see it). Three more optional fields, omitted when
+`g2mirror --list`, see it). Four more optional fields, omitted when
 false/absent: `headless` marks a wrapper running without a host terminal
 (`--headless`/`--detached`/server-launched), `detached` means headless
-with no client holding the host role, and `launched` names the server
-launch preset the session came from.
+with no client holding the host role, `launched` names the server
+launch preset the session came from, and `last_output_at` is when the
+wrapped app last wrote output (unix epoch ms; also pushed to the monitor
+as rate-limited `activity` messages — carried here so a fresh monitor or
+one-shot probe sees the recency).
 
 **`snapshot`** — the immediate answer to `view`, and re-sent unsolicited
 whenever the stream's dimensions change (see "Snapshot dimensions and size

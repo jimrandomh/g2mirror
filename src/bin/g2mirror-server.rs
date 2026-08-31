@@ -39,6 +39,9 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 struct TerminalState {
     /// Last bell (unix ms), if one has rung since monitoring began.
     last_bell_at: Option<u64>,
+    /// Last app output (unix ms), if any since monitoring began (seeded
+    /// from the connect greeting, then advanced by activity messages).
+    last_output_at: Option<u64>,
     /// Window title, if the app has set one since monitoring began.
     title: Option<String>,
     /// Real working directory, from the session's connect greeting (the
@@ -907,6 +910,9 @@ async fn run_monitor(path: &Path, name: &str, state: &BellState) -> anyhow::Resu
                 if let Some(title) = msg.get("title").and_then(|t| t.as_str()) {
                     terminal.title = Some(title.to_string());
                 }
+                if let Some(at) = msg.get("last_output_at").and_then(serde_json::Value::as_u64) {
+                    terminal.last_output_at = Some(terminal.last_output_at.unwrap_or(0).max(at));
+                }
                 terminal.detached = msg
                     .get("detached")
                     .and_then(serde_json::Value::as_bool)
@@ -939,6 +945,17 @@ async fn run_monitor(path: &Path, name: &str, state: &BellState) -> anyhow::Resu
                 ServerToDevice::Bell {
                     socket: name.to_string(),
                     last_bell_at: at,
+                }
+            }
+            Some("activity") => {
+                let Some(at) = msg.get("at").and_then(serde_json::Value::as_u64) else {
+                    continue;
+                };
+                let mut terminals = state.terminals.lock().unwrap();
+                terminals.entry(name.to_string()).or_default().last_output_at = Some(at);
+                ServerToDevice::Activity {
+                    socket: name.to_string(),
+                    last_output_at: at,
                 }
             }
             Some("title") => {
@@ -1057,6 +1074,7 @@ async fn handle_device(
                 if let Ok(event) = ev {
                     let socket = match &event {
                         ServerToDevice::Bell { socket, .. }
+                        | ServerToDevice::Activity { socket, .. }
                         | ServerToDevice::Title { socket, .. }
                         | ServerToDevice::Detached { socket, .. } => Some(socket.clone()),
                         _ => None,
@@ -1353,6 +1371,7 @@ fn list_sessions(dir: &Path, state: &BellState, filter: &[CompiledRule]) -> Vec<
                 pid: paths::socket_pid(&name).unwrap_or(0),
                 cwd_hint: name.split_once('-').map(|(_, p)| p).unwrap_or("").to_string(),
                 last_bell_at: terminal.last_bell_at,
+                last_output_at: terminal.last_output_at,
                 title: terminal.title,
                 detached: terminal.detached,
                 launched: terminal.launched,

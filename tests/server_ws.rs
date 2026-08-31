@@ -137,11 +137,12 @@ async fn server_auth_list_connect_and_relay() {
     assert_eq!(sessions[0]["last_bell_at"], Value::Null);
     assert_eq!(sessions[0]["title"], Value::Null);
 
-    // Bells and titles reported on the monitor connection are pushed to the
-    // device and recorded for subsequent lists.
+    // Bells, activity, and titles reported on the monitor connection are
+    // pushed to the device and recorded for subsequent lists.
     monitor_write
         .write_all(
             b"{\"type\":\"bell\",\"at\":1234567890123}\n\
+              {\"type\":\"activity\",\"at\":1234567890200}\n\
               {\"type\":\"title\",\"title\":\"long task \\u2014 running\"}\n",
         )
         .await
@@ -151,12 +152,17 @@ async fn server_auth_list_connect_and_relay() {
     assert_eq!(reply["socket"], socket_name.as_str());
     assert_eq!(reply["last_bell_at"], 1234567890123u64);
     let reply = recv(&mut ws).await;
+    assert_eq!(reply["type"], "activity");
+    assert_eq!(reply["socket"], socket_name.as_str());
+    assert_eq!(reply["last_output_at"], 1234567890200u64);
+    let reply = recv(&mut ws).await;
     assert_eq!(reply["type"], "title");
     assert_eq!(reply["socket"], socket_name.as_str());
     assert_eq!(reply["title"], "long task — running");
     send(&mut ws, json!({"type": "list"})).await;
     let reply = recv(&mut ws).await;
     assert_eq!(reply["sessions"][0]["last_bell_at"], 1234567890123u64);
+    assert_eq!(reply["sessions"][0]["last_output_at"], 1234567890200u64);
     assert_eq!(reply["sessions"][0]["title"], "long task — running");
 
     // Connect: the server dials the session socket and sends an init derived

@@ -35,6 +35,13 @@ const REFRESH_KEY: u8 = 0x0c;
 /// Bell notifications are debounced to at most one per this window.
 const BELL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Activity (output) notifications are rate-limited to at most one per this
+/// window, leading edge only: continuous output reports roughly once per
+/// window, and reports stop as soon as the output does (no trailing edge —
+/// unlike bells, a suppressed activity report is not a lost event, since
+/// the next output re-reports).
+const ACTIVITY_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Caps on client-requested input delays: each pause is clamped to this
 /// many milliseconds, and a single `input` message may carry at most this
 /// many delay entries.
@@ -466,6 +473,10 @@ async fn run(opts: WrapOpts) -> anyhow::Result<ExitStatus> {
     let mut host_attached = false;
     let mut next_client_id: u64 = 0;
     let mut bell = BellDebouncer::new(BELL_DEBOUNCE);
+    // Output-activity tracking: the precise timestamp goes in connect
+    // greetings; reports to the monitor are rate-limited (leading edge).
+    let mut last_output_at: Option<u64> = None;
+    let mut last_activity_report: Option<std::time::Instant> = None;
     let mut input_queue = InputQueue::default();
     let mut stdin_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 64 * 1024];
@@ -507,6 +518,17 @@ async fn run(opts: WrapOpts) -> anyhow::Result<ExitStatus> {
                         && let Some(at) = bell.on_bell(std::time::Instant::now(), now_ms()) {
                             send_bell(&mut monitor, at).await;
                         }
+                    let at = now_ms();
+                    last_output_at = Some(at);
+                    let report_now = std::time::Instant::now();
+                    if monitor.is_some()
+                        && last_activity_report
+                            .is_none_or(|sent| report_now.duration_since(sent)
+                                >= ACTIVITY_REPORT_INTERVAL)
+                    {
+                        last_activity_report = Some(report_now);
+                        send_activity(&mut monitor, at).await;
+                    }
                     let mut lost_one = false;
                     if let Some(data) = out.remote
                         && !data.is_empty() {
@@ -602,6 +624,7 @@ async fn run(opts: WrapOpts) -> anyhow::Result<ExitStatus> {
                     headless,
                     detached: headless && !host_attached,
                     launched: launched.clone(),
+                    last_output_at,
                 };
                 if new_client.send(&connect).await.is_ok() {
                     pendings.push(new_client);
@@ -907,6 +930,16 @@ async fn sweep_and_refresh(
 async fn send_bell(monitor: &mut Option<Client>, at: u64) {
     if let Some(m) = monitor.as_mut()
         && m.send(&FromSession::Bell { at }).await.is_err()
+    {
+        *monitor = None;
+    }
+}
+
+/// Report output activity to the monitor connection, dropping it if the
+/// send fails.
+async fn send_activity(monitor: &mut Option<Client>, at: u64) {
+    if let Some(m) = monitor.as_mut()
+        && m.send(&FromSession::Activity { at }).await.is_err()
     {
         *monitor = None;
     }

@@ -97,6 +97,8 @@ struct Probe {
     headless: bool,
     detached: bool,
     launched: Option<String>,
+    /// When the app last wrote output (unix epoch ms), if it has.
+    last_output_at: Option<u64>,
     /// Socket file age — effectively the session's uptime.
     age: Option<std::time::Duration>,
 }
@@ -144,6 +146,7 @@ async fn probe_one(path: &Path, age: Option<std::time::Duration>) -> anyhow::Res
         headless,
         detached,
         launched,
+        last_output_at,
         ..
     }) = conn.next().await?
     else {
@@ -158,6 +161,7 @@ async fn probe_one(path: &Path, age: Option<std::time::Duration>) -> anyhow::Res
         headless,
         detached,
         launched,
+        last_output_at,
         age,
     }))
 }
@@ -194,12 +198,20 @@ fn describe(p: &Probe) -> String {
         (None, Some(l)) => format!("[{l}]"),
         (None, None) => p.command.clone(),
     };
+    // Output within the last few seconds (the wrapper reports activity at
+    // most every 2s, so 5s of slack covers the reporting interval).
+    let active = p.last_output_at.is_some_and(|at| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .is_ok_and(|now| now.as_millis().saturating_sub(u128::from(at)) < 5000)
+    });
     format!(
-        "{state}  {:>6}  {}  {}  {}",
+        "{state}  {:>6}  {}  {}  {}{}",
         p.pid,
         tilde(&p.cwd),
         what,
-        uptime(p.age)
+        uptime(p.age),
+        if active { "  [active]" } else { "" }
     )
 }
 
@@ -852,6 +864,7 @@ mod tests {
             headless: true,
             detached: true,
             launched: Some("shell".into()),
+            last_output_at: None,
             age: None,
         };
         for pat in ["4321", "g2mirror", "frobnicator", "SHELL", "claude"] {
