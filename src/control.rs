@@ -35,6 +35,10 @@ impl ControlListener {
         Ok(Self { listener, path })
     }
 
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub async fn accept(&self) -> std::io::Result<UnixStream> {
         let (stream, _) = self.listener.accept().await?;
         Ok(stream)

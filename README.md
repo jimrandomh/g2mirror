@@ -24,7 +24,11 @@ truncated.
   for detached sessions: `g2mirror --detached <command>` starts one
   without a terminal, `g2mirror -l` lists sessions, and `g2mirror -a`
   claims a detached session into the current terminal (see "Launching
-  shells and detached sessions" below).
+  shells and detached sessions" below). The wrapped command gets
+  `$G2MIRROR_SESSION` (its session socket's path); a `g2mirror <command>`
+  run where that is set to a live socket — e.g. an alias that wraps
+  commands, used from an already-mirrored shell — just runs the command
+  without creating a second session (`--detached` still does).
 - **`g2mirror-server`** — a websocket gateway for device drivers. Reads
   `~/.g2mirror/config.json` (create it with `g2mirror-server
   --init-config`, which prints the first auth token once and writes a

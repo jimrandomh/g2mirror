@@ -236,6 +236,22 @@ fn main() {
         launched,
     };
 
+    // Already inside a mirrored terminal (e.g. an alias that wraps commands,
+    // run from a mirrored shell): another session would just duplicate this
+    // one, so be a transparent wrapper. Detached sessions are separate
+    // terminals, so they are always created.
+    if !detached && !headless && g2mirror::paths::enclosing_session().is_some() {
+        use std::os::unix::process::CommandExt as _;
+        let err = std::process::Command::new(&opts.program)
+            .args(&opts.args)
+            .exec();
+        eprintln!(
+            "g2mirror: failed to run {}: {err}",
+            opts.program.to_string_lossy()
+        );
+        std::process::exit(1);
+    }
+
     if detached {
         match spawn_detached(&opts) {
             Ok(()) => std::process::exit(0),
@@ -421,6 +437,7 @@ async fn run(opts: WrapOpts) -> anyhow::Result<ExitStatus> {
         .context("failed to set initial pty size")?;
     let mut child = pty_process::Command::new(&program)
         .args(&args)
+        .env(g2mirror::paths::SESSION_ENV, control.path())
         .spawn(pts)
         .with_context(|| format!("failed to spawn {}", program.to_string_lossy()))?;
     let command_line = std::iter::once(&program)

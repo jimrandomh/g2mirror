@@ -1051,3 +1051,42 @@ async fn host_role_refused_on_hosted_session() {
         "unexpected error: {err}"
     );
 }
+
+#[tokio::test]
+async fn nested_wrapper_runs_command_without_a_second_session() {
+    let dir = test_dir("nested");
+    let g2mirror = env!("CARGO_BIN_EXE_g2mirror");
+    // The outer wrapper exports its socket path; the nested g2mirror must
+    // exec the command directly (same $G2MIRROR_SESSION, no new socket).
+    // The outer one starts with a stale value, which must not stop it
+    // wrapping.
+    let script = r#"
+        outer="$G2MIRROR_SESSION"
+        [ -S "$outer" ] && echo outer-has-socket
+        OUTER="$outer" "$G2MIRROR" --title nested sh -c '
+            [ "$G2MIRROR_SESSION" = "$OUTER" ] && echo same-session
+            set -- "$G2MIRROR_DIR"/*
+            echo "sockets=$#"
+            exit 7'
+        echo "inner-status=$?"
+    "#;
+    let output = tokio::process::Command::new(g2mirror)
+        .args(["sh", "-c", script])
+        .env("G2MIRROR_DIR", &dir)
+        .env("G2MIRROR", g2mirror)
+        .env("G2MIRROR_SESSION", dir.join("gone"))
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(10), output)
+        .await
+        .expect("wrapper did not exit")
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for marker in ["outer-has-socket", "same-session", "sockets=1", "inner-status=7"] {
+        assert!(text.contains(marker), "missing {marker:?} in output:\n{text}");
+    }
+}

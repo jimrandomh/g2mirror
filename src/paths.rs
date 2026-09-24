@@ -24,6 +24,22 @@ pub fn g2mirror_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Set in the wrapped command's environment to the session socket's path,
+/// so a nested `g2mirror <command>` (e.g. from a shell alias) can tell it
+/// is already being mirrored and run the command unwrapped.
+pub const SESSION_ENV: &str = "G2MIRROR_SESSION";
+
+/// The session this process is running inside, per `$G2MIRROR_SESSION` —
+/// only if that socket still exists, so a stale value (the wrapper exited
+/// but a descendant, e.g. a tmux server, lives on) doesn't suppress
+/// wrapping forever.
+pub fn enclosing_session() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(SESSION_ENV)?);
+    std::fs::symlink_metadata(&path)
+        .is_ok_and(|m| m.file_type().is_socket())
+        .then_some(path)
+}
+
 pub fn config_path(dir: &Path) -> PathBuf {
     dir.join("config.json")
 }
