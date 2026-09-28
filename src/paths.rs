@@ -44,9 +44,34 @@ pub fn config_path(dir: &Path) -> PathBuf {
     dir.join("config.json")
 }
 
-/// Session socket file name: `<pid>-<sanitized-cwd>`.
-pub fn socket_name(pid: u32, cwd: &Path) -> String {
-    format!("{pid}-{}", sanitize_cwd(cwd))
+/// Longest socket path `bind` accepts: `sun_path` minus its NUL.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const MAX_SOCKET_PATH: usize = 107;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const MAX_SOCKET_PATH: usize = 103;
+
+/// Longest sanitized cwd kept in a socket name, even when there's room.
+const MAX_CWD_IN_NAME: usize = 60;
+
+/// Session socket path in `dir`: `<pid>-<sanitized-cwd>`, with the cwd part
+/// cut down (keeping its tail) as far as needed for the whole path to fit
+/// `sun_path` — down to a bare `<pid>` under a very long `$G2MIRROR_DIR`.
+pub fn socket_path(dir: &Path, pid: u32, cwd: &Path) -> PathBuf {
+    let room = MAX_SOCKET_PATH
+        .saturating_sub(dir.as_os_str().len() + 1)
+        .saturating_sub(pid.to_string().len() + 1);
+    dir.join(socket_name(pid, cwd, room.min(MAX_CWD_IN_NAME)))
+}
+
+/// Session socket file name: `<pid>-<sanitized-cwd>`, the cwd part at most
+/// `max_cwd` bytes (a bare `<pid>` when that's 0).
+fn socket_name(pid: u32, cwd: &Path, max_cwd: usize) -> String {
+    let cwd = sanitize_cwd(cwd, max_cwd);
+    if cwd.is_empty() {
+        pid.to_string()
+    } else {
+        format!("{pid}-{cwd}")
+    }
 }
 
 /// Parse the PID prefix out of a session socket file name.
@@ -64,10 +89,9 @@ pub fn is_valid_socket_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Replace characters that are awkward in file names and truncate, keeping
-/// the tail of the path (the most distinctive part). The limit keeps the
-/// whole socket path under the ~104-byte sun_path limit.
-fn sanitize_cwd(cwd: &Path) -> String {
+/// Replace characters that are awkward in file names and truncate to `max`
+/// bytes, keeping the tail of the path (the most distinctive part).
+fn sanitize_cwd(cwd: &Path, max: usize) -> String {
     let s = cwd.to_string_lossy();
     let sanitized: String = s
         .chars()
@@ -79,7 +103,6 @@ fn sanitize_cwd(cwd: &Path) -> String {
             }
         })
         .collect();
-    let max = 60;
     if sanitized.len() > max {
         sanitized[sanitized.len() - max..].to_string()
     } else {
@@ -137,15 +160,46 @@ mod tests {
 
     #[test]
     fn socket_names_are_sanitized_and_bounded() {
-        let name = socket_name(1234, Path::new("/Users/jim/my project/x"));
+        let home = Path::new("/home/jim/.g2mirror");
+        let path = socket_path(home, 1234, Path::new("/Users/jim/my project/x"));
+        let name = path.file_name().unwrap().to_str().unwrap();
         assert_eq!(name, "1234-_Users_jim_my_project_x");
-        assert!(is_valid_socket_name(&name));
-        assert_eq!(socket_pid(&name), Some(1234));
+        assert!(is_valid_socket_name(name));
+        assert_eq!(socket_pid(name), Some(1234));
 
         let long = "/a".repeat(200);
-        let name = socket_name(1, Path::new(&long));
-        assert!(name.len() <= 60 + 8);
-        assert!(is_valid_socket_name(&name));
+        let path = socket_path(home, 1, Path::new(&long));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), MAX_CWD_IN_NAME + 2);
+        assert!(is_valid_socket_name(name));
+    }
+
+    #[test]
+    fn socket_paths_fit_under_long_runtime_dirs() {
+        let cwd = Path::new("/home/jim/repositories/some-project/src");
+        for dir_len in [20, 60, 90, 100, 104, 150] {
+            let dir = PathBuf::from(format!("/{}", "d".repeat(dir_len - 1)));
+            let path = socket_path(&dir, 4_194_304, cwd);
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(is_valid_socket_name(name), "{name}");
+            assert_eq!(socket_pid(name), Some(4_194_304));
+            // Fits whenever the pid alone can; the tail of the cwd is kept.
+            if dir_len + 1 + 7 <= MAX_SOCKET_PATH {
+                let len = path.as_os_str().len();
+                assert!(len <= MAX_SOCKET_PATH, "{}", path.display());
+            }
+            if name.len() > 8 {
+                assert!("_home_jim_repositories_some-project_src".ends_with(&name[8..]));
+            }
+        }
+        // A real bind at the limit succeeds.
+        let tmp = std::env::temp_dir().join(format!("g2m-{}", std::process::id()));
+        let dir = tmp.join("x".repeat(MAX_SOCKET_PATH - tmp.as_os_str().len() - 30));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = socket_path(&dir, std::process::id(), cwd);
+        let bound = std::os::unix::net::UnixListener::bind(&path);
+        let _ = std::fs::remove_dir_all(&tmp);
+        bound.expect("socket path should fit sun_path");
     }
 
     #[test]

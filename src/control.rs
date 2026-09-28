@@ -23,11 +23,11 @@ impl ControlListener {
     /// Create ~/.g2mirror (permissions 700) and bind the session socket.
     pub fn bind() -> anyhow::Result<Self> {
         let dir = g2mirror::paths::g2mirror_dir().context("failed to create ~/.g2mirror")?;
-        let name = g2mirror::paths::socket_name(
+        let path = g2mirror::paths::socket_path(
+            &dir,
             std::process::id(),
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
         );
-        let path = dir.join(name);
         // A leftover file from a previous process with our (reused) pid.
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)

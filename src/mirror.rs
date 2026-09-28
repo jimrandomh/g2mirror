@@ -47,6 +47,9 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 /// terminal (application cursor keys, bracketed paste, mouse reporting).
 const RESET_INPUT_MODES: &[u8] =
     b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+/// Focus-event reporting (DECSET 1004), which vt100 doesn't track itself.
+const FOCUS_ON: &[u8] = b"\x1b[?1004h";
+const FOCUS_OFF: &[u8] = b"\x1b[?1004l";
 
 #[derive(Debug, Clone, Copy)]
 pub struct View {
@@ -56,15 +59,23 @@ pub struct View {
     pub simulated: bool,
 }
 
-/// Parser callbacks collecting out-of-band terminal events: audible bells
-/// and window-title changes (OSC 0/2, BEL- or ST-terminated). Going through
-/// the parser (rather than scanning bytes) avoids false positives — e.g. the
-/// BEL that terminates a title sequence is not a bell.
+/// Parser callbacks collecting out-of-band terminal events: audible bells,
+/// window-title changes (OSC 0/2, BEL- or ST-terminated), clipboard writes
+/// (OSC 52) and focus-event mode changes. Going through the parser (rather
+/// than scanning bytes) avoids false positives — e.g. the BEL that
+/// terminates a title sequence is not a bell — and copes with sequences
+/// split across reads.
 #[derive(Default)]
 struct Events {
     bells: usize,
     /// Last title set in this chunk, if any.
     title: Option<String>,
+    /// Clipboard writes in this chunk, re-encoded as OSC 52 sequences.
+    /// Reads (`?`) are deliberately not collected: answering them would
+    /// hand the clipboard to the app.
+    clipboard: Vec<u8>,
+    /// Last focus-event mode set in this chunk, if any.
+    focus: Option<bool>,
 }
 
 impl vt100::Callbacks for Events {
@@ -74,6 +85,33 @@ impl vt100::Callbacks for Events {
 
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.title = Some(String::from_utf8_lossy(title).into_owned());
+    }
+
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        // vt100 has already checked `ty` is selector characters and `data`
+        // is base64, so the pieces can't smuggle in a terminator.
+        self.clipboard.extend_from_slice(b"\x1b]52;");
+        self.clipboard.extend_from_slice(ty);
+        self.clipboard.push(b';');
+        self.clipboard.extend_from_slice(data);
+        self.clipboard.push(b'\x07');
+    }
+
+    fn unhandled_csi(
+        &mut self,
+        _: &mut vt100::Screen,
+        i1: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        // Called once per mode vt100 doesn't know, with the whole list.
+        if i1 == Some(b'?')
+            && matches!(c, 'h' | 'l')
+            && params.iter().any(|p| p.first() == Some(&1004))
+        {
+            self.focus = Some(c == 'h');
+        }
     }
 }
 
@@ -95,6 +133,9 @@ pub struct Mirror {
     /// Current window title, as last set by the app (survives view
     /// transitions, which rebuild the parser).
     title: Option<String>,
+    /// Whether the app has focus-event reporting on (likewise survives
+    /// rebuilds; vt100's input-mode helpers don't cover it).
+    focus_events: bool,
     /// Archive of lines that scrolled off the (primary) screen.
     history: History,
     /// Scroll counter: while parked at offset 1, every row pushed to the
@@ -121,6 +162,10 @@ pub struct Output {
     pub bells: usize,
     /// New window title, if it changed in this chunk.
     pub title: Option<String>,
+    /// OSC 52 clipboard writes from this chunk. Already in `host` (passed
+    /// through, or re-emitted while viewing) but never in `remote`: the
+    /// session decides which viewers may have their clipboard written.
+    pub clipboard: Vec<u8>,
 }
 
 /// What the event loop should do after a state change.
@@ -142,6 +187,7 @@ impl Mirror {
             shadow: None,
             view: None,
             title: None,
+            focus_events: false,
             history: History::new(DEFAULT_MAX_LINES),
             parked: false,
             staged_seen: 0,
@@ -282,6 +328,8 @@ impl Mirror {
         let scrolled = (self.history.next_index() - history_before) as usize;
         let bells = self.take_bells();
         let title = self.take_title_change();
+        let clipboard = std::mem::take(&mut self.parser.callbacks_mut().clipboard);
+        let focus = self.take_focus_change();
         match self.view {
             None => Output {
                 host: bytes.to_vec(),
@@ -290,6 +338,7 @@ impl Mirror {
                 // Pass-through already delivered the title sequence to
                 // the host; this is for the session socket only.
                 title,
+                clipboard,
             },
             Some(view) => {
                 let offset = self.region_offset();
@@ -361,15 +410,22 @@ impl Mirror {
                 if let Some(t) = &title {
                     host.extend_from_slice(format!("\x1b]2;{t}\x07").as_bytes());
                 }
+                host.extend_from_slice(&clipboard);
                 // The device terminal is exactly view-sized, so the
                 // same-size diff stream is correct for it.
-                let remote = Some(screen.state_diff(shadow.screen()));
+                let mut remote = screen.state_diff(shadow.screen());
+                if let Some(on) = focus {
+                    let seq = if on { FOCUS_ON } else { FOCUS_OFF };
+                    host.extend_from_slice(seq);
+                    remote.extend_from_slice(seq);
+                }
                 shadow.process(bytes);
                 Output {
                     host,
-                    remote,
+                    remote: Some(remote),
                     bells,
                     title,
+                    clipboard,
                 }
             }
         }
@@ -436,6 +492,17 @@ impl Mirror {
         }
     }
 
+    /// The focus-event mode set in the last processed chunk, if it differs
+    /// from the current one.
+    fn take_focus_change(&mut self) -> Option<bool> {
+        let on = self.parser.callbacks_mut().focus.take()?;
+        if on == self.focus_events {
+            return None;
+        }
+        self.focus_events = on;
+        Some(on)
+    }
+
     fn take_bells(&mut self) -> usize {
         std::mem::take(&mut self.parser.callbacks_mut().bells)
     }
@@ -459,7 +526,10 @@ impl Mirror {
     /// `rows` rows and first `cols` columns that fit the device screen.
     pub fn start_view(&mut self, view: View) -> Transition {
         self.flush_history_for_rebuild(view.rows);
-        let snapshot = render_snapshot(self.parser.screen(), view.rows, view.cols);
+        let mut snapshot = render_snapshot(self.parser.screen(), view.rows, view.cols);
+        if self.focus_events {
+            snapshot.extend_from_slice(FOCUS_ON);
+        }
 
         // Rebuild the model at device dimensions, primed with the snapshot,
         // so subsequent diffs (for both destinations) start from what the
@@ -606,6 +676,9 @@ impl Mirror {
                 out.extend_from_slice(SGR_RESET);
                 out.extend_from_slice(SHOW_CURSOR);
                 out.extend_from_slice(RESET_INPUT_MODES);
+                if self.focus_events {
+                    out.extend_from_slice(FOCUS_OFF);
+                }
                 out.extend_from_slice(cup(self.host_rows.saturating_sub(1), 0).as_bytes());
                 out.extend_from_slice(b"\r\n");
                 out
@@ -1170,6 +1243,63 @@ mod tests {
             .iter()
             .map(|r| render_record(r).screen().contents().trim_end().to_string())
             .collect()
+    }
+
+    #[test]
+    fn clipboard_writes_reach_the_host_but_not_the_remote_stream() {
+        let seq = b"\x1b]52;c;aGVsbG8=\x07";
+        let mut mirror = Mirror::new(24, 80);
+        // Pass-through, split across reads: the host already has the raw
+        // bytes; the session still learns of the write once it completes.
+        let out = mirror.process(&seq[..6]);
+        assert!(out.clipboard.is_empty());
+        let out = mirror.process(&seq[6..]);
+        assert_eq!(out.clipboard, seq);
+
+        let mut host = term(24, 80);
+        start_view(&mut mirror, &mut host);
+        // ST-terminated input comes out BEL-terminated, on the host only.
+        let out = mirror.process(b"x\x1b]52;c;aGVsbG8=\x1b\\y");
+        assert_eq!(out.clipboard, seq);
+        assert!(out.host.windows(seq.len()).any(|w| w == seq));
+        assert!(!out.remote.unwrap().windows(4).any(|w| w == b"]52;"));
+
+        // Reads would leak the clipboard to the app: never collected.
+        let out = mirror.process(b"\x1b]52;c;?\x07");
+        assert!(out.clipboard.is_empty());
+        assert!(!out.host.windows(4).any(|w| w == b"]52;"));
+    }
+
+    #[test]
+    fn focus_event_mode_is_streamed_snapshotted_and_reset() {
+        let has = |bytes: &[u8], seq: &[u8]| bytes.windows(seq.len()).any(|w| w == seq);
+        let mut mirror = Mirror::new(24, 80);
+        mirror.process(b"\x1b[?1004;2004h");
+
+        // Enabled before the view: the snapshot carries it...
+        let t = mirror.start_view(SIM);
+        let snapshot = t.remote_output.unwrap();
+        assert!(has(&snapshot, FOCUS_ON));
+        // ...and a client rendering that stream turns it on in its own
+        // terminal, then off again when it leaves.
+        let mut client = Mirror::new(30, 100);
+        client.start_view(SIM);
+        assert!(has(&client.process(&snapshot).host, FOCUS_ON));
+        assert!(has(&client.cleanup(), FOCUS_OFF));
+
+        // Changes while viewing reach the host and the remote stream once.
+        let out = mirror.process(b"\x1b[?1004l");
+        assert!(has(&out.host, FOCUS_OFF) && has(&out.remote.unwrap(), FOCUS_OFF));
+        let out = mirror.process(b"\x1b[?1004l");
+        assert!(!has(&out.remote.unwrap(), FOCUS_OFF));
+        let out = mirror.process(b"\x1b[?1004h");
+        assert!(has(&out.host, FOCUS_ON) && has(&out.remote.unwrap(), FOCUS_ON));
+
+        // The mode survives the parser rebuilds of a view cycle (the app
+        // won't re-send it), and the reset of other input modes on the way.
+        assert!(!has(&mirror.end_view().host_output, FOCUS_OFF));
+        assert!(has(&mirror.start_view(SIM).remote_output.unwrap(), FOCUS_ON));
+        assert!(has(&mirror.cleanup(), FOCUS_OFF));
     }
 
     #[test]

@@ -336,8 +336,12 @@ fn spawn_detached(opts: &WrapOpts) -> anyhow::Result<()> {
     // getcwd is symlink-free, so this matches the socket name the child
     // computes for itself.
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-    let socket = g2mirror::paths::socket_name(child.id(), &cwd);
-    let socket_path = g2mirror::paths::g2mirror_dir()?.join(&socket);
+    let socket_path =
+        g2mirror::paths::socket_path(&g2mirror::paths::g2mirror_dir()?, child.id(), &cwd);
+    let socket = socket_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     // Only report success once the session socket exists; a launch that
     // prints a socket name nothing will ever answer on helps nobody.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -546,20 +550,8 @@ async fn run(opts: WrapOpts) -> anyhow::Result<ExitStatus> {
                         last_activity_report = Some(report_now);
                         send_activity(&mut monitor, at).await;
                     }
-                    let mut lost_one = false;
-                    if let Some(data) = out.remote
-                        && !data.is_empty() {
-                            let msg = FromSession::Output {
-                                data: protocol::encode_terminal_bytes(&data),
-                            };
-                            for c in viewers.iter_mut()
-                                .filter(|c| c.state == ClientState::Viewing) {
-                                if c.send(&msg).await.is_err() {
-                                    c.dead = true;
-                                    lost_one = true;
-                                }
-                            }
-                        }
+                    let mut lost_one =
+                        send_output(&mut viewers, out.remote, &out.clipboard).await;
                     if let Some(title) = out.title {
                         send_title(&mut monitor, &title).await;
                         let msg = FromSession::Title { title };
@@ -619,7 +611,7 @@ async fn run(opts: WrapOpts) -> anyhow::Result<ExitStatus> {
                 // current model size (the last view size, or the initial
                 // size before any view).
                 let (greet_rows, greet_cols) = if headless {
-                    mirror.host_size()
+                    mirror.view().map_or(mirror.host_size(), |v| (v.rows, v.cols))
                 } else {
                     host_size()
                 };
@@ -1121,18 +1113,43 @@ async fn drain_pty(
         }
         let out = mirror.process(&buf[..n]);
         stdout.write(&out.host).await?;
-        if let Some(data) = out.remote
-            && !data.is_empty() {
-                let msg = FromSession::Output {
-                    data: protocol::encode_terminal_bytes(&data),
-                };
-                for c in viewers.iter_mut().filter(|c| c.state == ClientState::Viewing) {
-                    if c.send(&msg).await.is_err() {
-                        c.dead = true;
-                    }
-                }
-                viewers.retain(|c| !c.dead);
-            }
+        if send_output(viewers, out.remote, &out.clipboard).await {
+            viewers.retain(|c| !c.dead);
+        }
     }
     Ok(())
+}
+
+/// Stream a chunk of translated output to the viewing clients, marking any
+/// that fail as dead; returns whether one did. Clipboard writes (OSC 52) go
+/// only to host-role clients — an attach client stands in for the host
+/// terminal, whose clipboard the app may set — never to devices or
+/// spectators, whose clipboards are theirs.
+async fn send_output(
+    viewers: &mut [Client],
+    remote: Option<Vec<u8>>,
+    clipboard: &[u8],
+) -> bool {
+    let remote = remote.unwrap_or_default();
+    let message = |data: &[u8]| FromSession::Output {
+        data: protocol::encode_terminal_bytes(data),
+    };
+    let plain = (!remote.is_empty()).then(|| message(&remote));
+    let with_clipboard =
+        (!clipboard.is_empty()).then(|| message(&[&remote[..], clipboard].concat()));
+    let mut lost_one = false;
+    for c in viewers.iter_mut().filter(|c| c.state == ClientState::Viewing) {
+        let msg = match (&with_clipboard, c.role) {
+            (Some(msg), Role::Host) => msg,
+            _ => match &plain {
+                Some(msg) => msg,
+                None => continue,
+            },
+        };
+        if c.send(msg).await.is_err() {
+            c.dead = true;
+            lost_one = true;
+        }
+    }
+    lost_one
 }

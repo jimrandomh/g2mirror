@@ -963,13 +963,16 @@ async fn headless_host_role_claim_force_and_resize() {
     assert_eq!(snapshot["width"], 90);
     assert_eq!(snapshot["height"], 28);
 
-    // C disconnects: the session is detached again.
+    // C disconnects: the session is detached again, and keeps (and
+    // reports) the size it was last viewed at.
     drop(c_reader);
     drop(c_write);
     let changed = read_until_type(&mut mon_reader, "host_changed").await;
     assert_eq!(changed["attached"], false);
     let (_r, _w, greeting) = connect_session(&socket).await;
     assert_eq!(greeting["detached"], true);
+    assert_eq!(greeting["host_width"], 90);
+    assert_eq!(greeting["host_height"], 28);
 }
 
 #[tokio::test]
@@ -1089,4 +1092,59 @@ async fn nested_wrapper_runs_command_without_a_second_session() {
     for marker in ["outer-has-socket", "same-session", "sockets=1", "inner-status=7"] {
         assert!(text.contains(marker), "missing {marker:?} in output:\n{text}");
     }
+}
+
+#[tokio::test]
+async fn clipboard_writes_reach_host_role_clients_only() {
+    let dir = test_dir("clip");
+    let mut _wrapper = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args([
+            "--headless", "--initial-size", "80x24", "--",
+            "sh", "-c", "read x; printf '\\033]52;c;aGk=\\007copied\\n'; cat",
+        ])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let socket = wait_socket(&dir, _wrapper.id().unwrap()).await;
+
+    // An attach client (host role) and a device (viewer) both watch.
+    let (mut host_reader, mut host_write, _) = connect_session(&socket).await;
+    send_msg(&mut host_write, json!({
+        "type": "init", "version": 1, "device": "attach",
+        "width": 80, "height": 24, "role": "host",
+    })).await;
+    send_msg(&mut host_write, json!({"type": "view"})).await;
+    read_until_type(&mut host_reader, "snapshot").await;
+    let (mut dev_reader, mut dev_write, _) = connect_session(&socket).await;
+    send_msg(&mut dev_write, json!({
+        "type": "init", "version": 1, "device": "glasses", "width": 80, "height": 24,
+    })).await;
+    send_msg(&mut dev_write, json!({"type": "view"})).await;
+    read_until_type(&mut dev_reader, "snapshot").await;
+
+    // The app copies "hi" to the clipboard once it gets a line of input.
+    send_msg(&mut host_write, json!({"type": "input", "data": base64_encode(b"go\r")})).await;
+    async fn stream_until_copied(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) -> Vec<u8> {
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("copied") {
+            let msg = read_until_type(reader, "output").await;
+            seen.extend(base64_decode(msg["data"].as_str().unwrap()));
+        }
+        seen
+    }
+    let clip = b"\x1b]52;c;aGk=\x07";
+    let host_saw = stream_until_copied(&mut host_reader).await;
+    assert!(
+        host_saw.windows(clip.len()).any(|w| w == clip),
+        "attach client got no clipboard write"
+    );
+    let dev_saw = stream_until_copied(&mut dev_reader).await;
+    assert!(!dev_saw.windows(4).any(|w| w == b"]52;"), "device got the clipboard write");
 }

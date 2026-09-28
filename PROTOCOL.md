@@ -270,6 +270,11 @@ session; drivers never need it. At most one client holds the role — a
 second host-role init is refused unless it adds `"force": true`, which
 displaces the previous holder (it gets an `error` and is dropped). On a
 session with a real host terminal, host-role inits are always refused.
+The host-role client's `output` stream also carries the app's clipboard
+writes (OSC 52, `ESC ] 52 ; <selector> ; <base64> BEL`), which it hands to
+its own terminal just as a host terminal would receive them; no other
+client ever gets them, so an app can't write to a device's or spectator's
+clipboard.
 
 Any viewer may later send `{"type": "resize", "width": 100, "height": 30}`
 to update the dimensions it declared in `init` (host-role clients forward
@@ -497,8 +502,8 @@ Fetch lazily, paging backwards from the splice point:
 
 Sequences that change how a terminal is expected to encode keys — DECCKM
 application cursor keys (`CSI ? 1 h/l`), application keypad (`ESC =`/
-`ESC >`), bracketed paste (`CSI ? 2004 h/l`), and the xterm mouse modes —
-are mirrored unmodified into the snapshot/output byte stream, so the
+`ESC >`), bracketed paste (`CSI ? 2004 h/l`), the xterm mouse modes, and
+focus-event reporting (`CSI ? 1004 h/l`) — are mirrored unmodified into the snapshot/output byte stream, so the
 driver's emulator always knows the current modes. When you eventually send
 special keys, encode them according to that state (e.g. Up arrow is
 `ESC [ A` normally but `ESC O A` in application-cursor mode), and when
