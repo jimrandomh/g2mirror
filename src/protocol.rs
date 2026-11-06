@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The `error` a host-role client receives when another attach client takes
+/// the role over with `force`, just before the wrapper drops it.
+pub const HOST_TAKEN_OVER: &str = "host role taken over by another attach client";
+
 /// Session protocol: client -> wrapper.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

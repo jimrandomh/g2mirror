@@ -163,6 +163,16 @@ several sessions match, a small picker opens; `--force` takes the host
 role over from another attach client (e.g. a tab you lost over ssh).
 When the wrapped command exits, the attach client exits with its status.
 
+`--watch` lets several terminals share one session, one in control at a
+time (e.g. the same session open in two browser tabs). A client that loses
+the host role to another `--force` attach keeps watching instead of
+exiting: it becomes a plain viewer ranked below everyone, so it never
+resizes the app, and its title reads `[watching] …`. A keypress or click
+in it takes the role back with `--force` (the keystroke is then
+forwarded; the click isn't), and the other terminal drops to watching in
+turn. Without `--force`, `g2mirror -a --watch` claims a detached session
+as usual and opens a held one watching.
+
 `g2mirror --detached [--title …] -- <command>` starts a detached session
 from the laptop side (it prints the socket name and pid) — handy for
 kicking off long jobs to watch from the glasses later. Attaching to

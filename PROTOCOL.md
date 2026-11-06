@@ -264,7 +264,8 @@ the host below every viewer.
 
 An `init` may also declare `"role": "host"` (default `"viewer"`) on a
 **headless** session: the client's size then occupies the `"host"` slot in
-the precedence order instead of ranking by token, and the session stops
+the precedence order instead of ranking by token (winning a tie with a
+viewer of the same rank, whichever connected first), and the session stops
 counting as detached. This is how `g2mirror --attach` claims a detached
 session; drivers never need it. At most one client holds the role — a
 second host-role init is refused unless it adds `"force": true`, which

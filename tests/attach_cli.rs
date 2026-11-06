@@ -78,8 +78,22 @@ fn spawn_attach(
     pty_process::OwnedReadPty,
     pty_process::OwnedWritePty,
 ) {
+    spawn_attach_sized(dir, args, 24, 80)
+}
+
+/// Spawn `g2mirror --attach [args]` on a fresh `rows`x`cols` pty.
+fn spawn_attach_sized(
+    dir: &std::path::Path,
+    args: &[&str],
+    rows: u16,
+    cols: u16,
+) -> (
+    tokio::process::Child,
+    pty_process::OwnedReadPty,
+    pty_process::OwnedWritePty,
+) {
     let (pty, pts) = pty_process::open().unwrap();
-    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    pty.resize(pty_process::Size::new(rows, cols)).unwrap();
     let child = pty_process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
         .arg("-a")
         .args(args)
@@ -195,4 +209,108 @@ async fn detached_list_attach_detach_and_reattach() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Press Enter in an attached terminal until the app below answers with a
+/// size report numbered at least `n`, and return the latest one ("R C").
+/// Enter is retried because keys typed before the client is live are lost
+/// to its switch to raw mode.
+async fn ask_size(
+    read: &mut pty_process::OwnedReadPty,
+    write: &mut pty_process::OwnedWritePty,
+    term: &mut vt100::Parser,
+    n: u32,
+) -> String {
+    let latest = |s: &vt100::Screen| {
+        s.contents()
+            .lines()
+            .filter_map(|l| {
+                let (num, size) = l.strip_prefix("size")?.split_once(": ")?;
+                Some((num.parse::<u32>().ok()?, size.trim().to_string()))
+            })
+            .max()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        write.write_all(b"\r").await.unwrap();
+        let settle = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Ok(k)) = tokio::time::timeout_at(settle, read.read(&mut buf)).await {
+            if k == 0 {
+                break;
+            }
+            term.process(&buf[..k]);
+        }
+        if let Some((m, size)) = latest(term.screen())
+            && m >= n
+        {
+            return size;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no size{n} report; screen:\n{}",
+            term.screen().contents()
+        );
+    }
+}
+
+/// A terminal that re-attaches with --force (a reloaded tab, a dropped
+/// connection) sizes the app even though a terminal watching since earlier
+/// connected first: watching never resizes the app while someone holds it.
+#[tokio::test]
+async fn reattaching_host_outranks_an_earlier_watcher() {
+    let dir = test_dir("rehost");
+
+    // Each Enter makes the app report its size, numbered, on its bottom
+    // row: a terminal smaller than the app shows the bottom rows.
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_g2mirror"))
+        .args([
+            "--detached", "--",
+            "sh", "-c",
+            "n=0; while read l; do n=$((n+1)); printf '\\033[999;1H\\nsize%s: %s' $n \"$(stty size)\"; done",
+        ])
+        .env("G2MIRROR_DIR", &dir)
+        .current_dir("/")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--detached failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let socket_name = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    let pid: u32 = socket_name.split('-').next().unwrap().parse().unwrap();
+    let _cleanup = KillOnDrop(pid);
+    let args = ["--force", "--watch"];
+
+    // A big terminal claims the session.
+    let (_big, mut bread, mut bwrite) = spawn_attach_sized(&dir, &args, 30, 150);
+    let mut bterm = vt100::Parser::new(30, 150, 500);
+    assert_eq!(
+        ask_size(&mut bread, &mut bwrite, &mut bterm, 1).await,
+        "30 150"
+    );
+    // Keep draining it while it watches, so it never blocks the session.
+    tokio::spawn(async move { drain_to_eof(&mut bread).await });
+
+    // A small one takes it over; the big one drops to watching.
+    let (mut small, mut sread, mut swrite) = spawn_attach_sized(&dir, &args, 12, 60);
+    let mut sterm = vt100::Parser::new(12, 60, 500);
+    assert_eq!(
+        ask_size(&mut sread, &mut swrite, &mut sterm, 2).await,
+        "12 60"
+    );
+
+    // The small terminal goes away and comes back (a reloaded tab): it
+    // holds the session again, so the app takes its size, not the size of
+    // the terminal that has been watching since before it reconnected.
+    small.kill().await.unwrap();
+    drop((sread, swrite));
+    let (_small, mut sread, mut swrite) = spawn_attach_sized(&dir, &args, 12, 60);
+    let mut sterm = vt100::Parser::new(12, 60, 500);
+    assert_eq!(
+        ask_size(&mut sread, &mut swrite, &mut sterm, 3).await,
+        "12 60"
+    );
 }

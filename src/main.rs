@@ -113,7 +113,7 @@ fn usage() -> ! {
     );
     eprintln!("       g2mirror --detached [same options] <command> [args...]");
     eprintln!("       g2mirror --list | -l");
-    eprintln!("       g2mirror --attach | -a [pattern] [--force] [--detach-key <key>]");
+    eprintln!("       g2mirror --attach | -a [pattern] [--force] [--watch] [--detach-key <key>]");
     eprintln!("  --title       initial window title, until the program sets one itself");
     eprintln!("  --readonly    reject input from connected devices");
     eprintln!(
@@ -124,6 +124,10 @@ fn usage() -> ! {
     eprintln!("  --list        list live sessions (detached ones first)");
     eprintln!("  --attach      give a detached session this terminal; the pattern");
     eprintln!("                matches pid, title, or cwd. Ctrl+\\ detaches again");
+    eprintln!("  --watch       with --attach: when another attach client takes the");
+    eprintln!("                session over, keep watching it here; a key or click");
+    eprintln!("                takes it back. Without --force, a held session opens");
+    eprintln!("                watching");
     eprintln!("  Ctrl+G simulates glasses connect/disconnect");
     eprintln!("  Ctrl+L (passed through) refreshes mirrored scrollback while viewing");
     std::process::exit(2);
@@ -690,8 +694,7 @@ async fn run(opts: WrapOpts) -> anyhow::Result<ExitStatus> {
                                         .filter(|c| c.role == Role::Host)
                                     {
                                         let _ = c.send(&FromSession::Error {
-                                            message: "host role taken over \
-                                                      by another attach client".into(),
+                                            message: g2mirror::protocol::HOST_TAKEN_OVER.into(),
                                         }).await;
                                         c.dead = true;
                                     }
@@ -845,10 +848,14 @@ async fn refresh_view(
     pty_write: &pty_process::OwnedWritePty,
     stdout: &mut HostTerm,
 ) -> anyhow::Result<()> {
+    // Ties go to the host-role client, then to the earlier connection. An
+    // attach client that reconnects (a reloaded browser tab) connects after
+    // the ones already watching, which rank as low as the host by default;
+    // the earlier-connection rule alone would let a watcher size the app.
     let best = viewers
         .iter()
         .filter(|c| !c.dead && c.state == ClientState::Viewing)
-        .min_by_key(|c| (effective_rank(c, host_rank), c.id));
+        .min_by_key(|c| (effective_rank(c, host_rank), c.role != Role::Host, c.id));
     let target = best.map(|c| {
         if headless || effective_rank(c, host_rank) <= host_rank {
             (c.height, c.width)

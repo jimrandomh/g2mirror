@@ -31,10 +31,19 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const ENTER_ALT: &[u8] = b"\x1b[?1049h\x1b[?25l";
 const LEAVE_ALT: &[u8] = b"\x1b[?25h\x1b[?1049l";
 const SGR_RESET: &[u8] = b"\x1b[0m";
+/// While watching (`--watch`), report mouse button presses (X10 mode, SGR
+/// encoding) so a click can take the session back. X10 reports presses
+/// only, so no release report is left over to leak into the app once the
+/// host role is back. Switched off again before reclaiming.
+const MOUSE_ON: &[u8] = b"\x1b[?9h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?9l";
 
 pub struct AttachOpts {
     pub pattern: Option<String>,
     pub force: bool,
+    /// On losing the host role to another attach client, keep watching
+    /// instead of exiting; a keypress or click takes the role back.
+    pub watch: bool,
     pub detach_key: Option<u8>,
 }
 
@@ -42,12 +51,14 @@ pub fn parse_attach_args(args: &[std::ffi::OsString]) -> anyhow::Result<AttachOp
     let mut opts = AttachOpts {
         pattern: None,
         force: false,
+        watch: false,
         detach_key: Some(DEFAULT_DETACH_KEY),
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.to_str() {
             Some("--force") => opts.force = true,
+            Some("--watch") => opts.watch = true,
             Some("--detach-key") => {
                 let value = it
                     .next()
@@ -250,11 +261,18 @@ pub async fn attach(opts: AttachOpts) -> anyhow::Result<i32> {
     );
     let probes = probe_all().await?;
     // Without --force only detached sessions are claimable; with it, any
-    // headless session (taking the role over). Sessions with a real host
+    // headless session (taking the role over). --watch also accepts a held
+    // headless session, starting out watching it. Sessions with a real host
     // terminal are never claimable — g2mirror-view covers watching those.
     let candidates: Vec<Probe> = probes
         .iter()
-        .filter(|p| if opts.force { p.headless } else { p.detached })
+        .filter(|p| {
+            if opts.force || opts.watch {
+                p.headless
+            } else {
+                p.detached
+            }
+        })
         .filter(|p| {
             opts.pattern
                 .as_deref()
@@ -298,7 +316,15 @@ pub async fn attach(opts: AttachOpts) -> anyhow::Result<i32> {
             None => return Ok(0),
         },
     };
-    run_attached(&target, opts.force, opts.detach_key).await
+    let start_watching = opts.watch && !opts.force && !target.detached;
+    run_attached(
+        &target,
+        opts.force,
+        opts.detach_key,
+        opts.watch,
+        start_watching,
+    )
+    .await
 }
 
 /// Several candidates: a minimal alt-screen picker (arrows/enter/q).
@@ -391,9 +417,103 @@ enum Mode {
     Live { mirror: Box<Mirror> },
 }
 
+/// Which role the next connection to the session takes.
+enum Phase {
+    /// Hold the host role: this terminal drives the app. `carry` is input
+    /// to forward once live (the keystroke that ended a watch).
+    Host {
+        force: bool,
+        fetch_history: bool,
+        carry: Vec<u8>,
+    },
+    /// `--watch`: view a session another attach client holds, without
+    /// affecting its size, until a keypress or click takes it back.
+    Watch,
+}
+
+/// How one connection to the session ended.
+enum PhaseEnd {
+    /// The wrapped app exited, the session went away, or stdin closed.
+    Ended,
+    /// The detach key was pressed; the session keeps running.
+    Detached,
+    /// Another attach client took the host role over with --force.
+    Displaced,
+    /// Watching, the user asked for control back; carries the keystrokes
+    /// to forward once the host role is held (mouse reports dropped).
+    Reclaim(Vec<u8>),
+}
+
 /// Claim the session and mirror it until the app exits (its exit status is
-/// propagated) or the detach key is pressed (returns 0).
-async fn run_attached(probe: &Probe, force: bool, detach_key: Option<u8>) -> anyhow::Result<i32> {
+/// propagated) or the detach key is pressed (returns 0). With `watch`,
+/// losing the host role to another attach client switches this terminal to
+/// watching instead of exiting, and a keypress or click there takes the
+/// role back (displacing the other client in turn).
+async fn run_attached(
+    probe: &Probe,
+    force: bool,
+    detach_key: Option<u8>,
+    watch: bool,
+    start_watching: bool,
+) -> anyhow::Result<i32> {
+    // Raw mode spans every phase, so nothing echoes while switching.
+    let _raw = RawGuard::new().context("failed to enter raw mode")?;
+    // One stdin for every phase: tokio reads it on a blocking thread that
+    // can't be cancelled, so a phase ending mid-read leaves that read in
+    // flight. Reusing the handle hands its bytes to the next phase; a fresh
+    // handle per phase would silently drop them (the keystroke or click
+    // that should have ended a watch).
+    let mut stdin = tokio::io::stdin();
+    let mut phase = if start_watching {
+        Phase::Watch
+    } else {
+        Phase::Host {
+            force,
+            fetch_history: true,
+            carry: Vec::new(),
+        }
+    };
+    loop {
+        let (end, exit_status) = run_phase(probe, phase, detach_key, &mut stdin).await?;
+        phase = match end {
+            PhaseEnd::Displaced if watch => Phase::Watch,
+            PhaseEnd::Displaced => anyhow::bail!("session closed: {}", protocol::HOST_TAKEN_OVER),
+            PhaseEnd::Reclaim(carry) => Phase::Host {
+                force: true,
+                fetch_history: false,
+                carry,
+            },
+            PhaseEnd::Detached => {
+                eprintln!(
+                    "g2mirror: detached; the session keeps running \u{2014} reattach with: g2mirror -a {}",
+                    probe.pid
+                );
+                return Ok(0);
+            }
+            PhaseEnd::Ended => {
+                return Ok(match exit_status {
+                    Some(status) => {
+                        eprintln!("g2mirror: session ended (exit status {status})");
+                        status
+                    }
+                    None => {
+                        eprintln!("g2mirror: session ended");
+                        1
+                    }
+                });
+            }
+        };
+    }
+}
+
+/// One connection to the session in `phase`'s role, until it ends. Returns
+/// how it ended and the app's exit status, if it exited.
+async fn run_phase(
+    probe: &Probe,
+    phase: Phase,
+    detach_key: Option<u8>,
+    stdin: &mut tokio::io::Stdin,
+) -> anyhow::Result<(PhaseEnd, Option<i32>)> {
     let mut conn = SessionClient::connect(&probe.path)
         .await
         .with_context(|| format!("cannot connect to {}", probe.path.display()))?;
@@ -408,23 +528,39 @@ async fn run_attached(probe: &Probe, force: bool, detach_key: Option<u8>) -> any
     };
     let history_oldest = history.oldest;
     let (rows, cols) = host_size();
+    let watching = matches!(phase, Phase::Watch);
+    let (role, force, size_rank, fetch_history, carry) = match phase {
+        Phase::Host {
+            force,
+            fetch_history,
+            carry,
+        } => (Role::Host, force, None, fetch_history, carry),
+        // The worst rank there is: every other viewer outranks a watcher,
+        // and so does the host (a better rank, or the host role on a tie),
+        // so watching never resizes the app.
+        Phase::Watch => (Role::Viewer, false, Some(u32::MAX), false, Vec::new()),
+    };
     conn.send(&ToSession::Init {
         version: PROTOCOL_VERSION,
-        device: "g2mirror --attach".into(),
+        device: if watching {
+            "g2mirror --attach (watching)"
+        } else {
+            "g2mirror --attach"
+        }
+        .into(),
         width: cols,
         height: rows,
-        size_rank: None,
+        size_rank,
         host_size_rank: None,
-        role: Role::Host,
+        role,
         force,
     })
     .await?;
     conn.send(&ToSession::View).await?;
-    if readonly {
-        eprintln!("g2mirror: note: this session is read-only; keystrokes will be ignored");
+    if readonly && fetch_history {
+        eprint!("g2mirror: note: this session is read-only; keystrokes will be ignored\r\n");
     }
 
-    let _raw = RawGuard::new().context("failed to enter raw mode")?;
     let mut app = Attached {
         conn,
         stdout: tokio::io::stdout(),
@@ -436,45 +572,30 @@ async fn run_attached(probe: &Probe, force: bool, detach_key: Option<u8>) -> any
         exit_status: None,
         last_error: None,
         detached: false,
+        watching,
+        fetch_history,
+        carry,
+        title,
+        reclaim: None,
     };
-    if let Some(t) = &title {
-        let clean: String = t.chars().filter(|c| !c.is_control()).collect();
-        app.stdout
-            .write_all(format!("\x1b]2;{clean}\x07").as_bytes())
-            .await?;
-        app.stdout.flush().await?;
-    }
-    let result = app.run().await;
+    app.write_title().await?;
+    let result = app.run(stdin).await;
 
     // Restore the terminal whatever happened.
     let mut out = Vec::new();
     if let Mode::Live { mirror } = &app.mode {
         out.extend_from_slice(&mirror.cleanup());
     }
+    if watching {
+        out.extend_from_slice(MOUSE_OFF);
+    }
     out.extend_from_slice(SGR_RESET);
     out.extend_from_slice(b"\x1b[?25h");
     app.stdout.write_all(&out).await?;
     app.stdout.flush().await?;
+    let exit_status = app.exit_status;
     drop(app.conn);
-
-    result?;
-    if app.detached {
-        eprintln!(
-            "g2mirror: detached; the session keeps running \u{2014} reattach with: g2mirror -a {}",
-            probe.pid
-        );
-        return Ok(0);
-    }
-    match app.exit_status {
-        Some(status) => {
-            eprintln!("g2mirror: session ended (exit status {status})");
-            Ok(status)
-        }
-        None => {
-            eprintln!("g2mirror: session ended");
-            Ok(1)
-        }
-    }
+    Ok((result?, exit_status))
 }
 
 struct Attached {
@@ -492,11 +613,22 @@ struct Attached {
     /// closes unexpectedly.
     last_error: Option<String>,
     detached: bool,
+    /// Viewing without the host role (`--watch`): any key or click
+    /// reclaims instead of being forwarded.
+    watching: bool,
+    /// Print the session's scrollback into this terminal on going live.
+    /// Only the first phase does; later ones would duplicate it.
+    fetch_history: bool,
+    /// Input to forward once live (the keystroke that ended a watch).
+    carry: Vec<u8>,
+    /// The session's window title, if it has set one.
+    title: Option<String>,
+    /// Set by a keypress or click while watching.
+    reclaim: Option<Vec<u8>>,
 }
 
 impl Attached {
-    async fn run(&mut self) -> anyhow::Result<()> {
-        let mut stdin = tokio::io::stdin();
+    async fn run(&mut self, stdin: &mut tokio::io::Stdin) -> anyhow::Result<PhaseEnd> {
         let mut winch = signal(SignalKind::window_change())?;
         let mut keybuf = [0u8; 4096];
         loop {
@@ -504,7 +636,7 @@ impl Attached {
                 msg = self.conn.next() => match msg? {
                     Some(msg) => {
                         if !self.on_message(msg).await? {
-                            return Ok(());
+                            return Ok(PhaseEnd::Ended);
                         }
                     }
                     None => {
@@ -513,20 +645,26 @@ impl Attached {
                         // e.g. a --force takeover).
                         if self.exit_status.is_none() && !self.detached {
                             match self.last_error.take() {
+                                Some(e) if e == protocol::HOST_TAKEN_OVER => {
+                                    return Ok(PhaseEnd::Displaced);
+                                }
                                 Some(e) => anyhow::bail!("session closed: {e}"),
                                 None => anyhow::bail!("session closed unexpectedly"),
                             }
                         }
-                        return Ok(());
+                        return Ok(PhaseEnd::Ended);
                     }
                 },
                 n = stdin.read(&mut keybuf) => match n {
-                    Ok(0) => return Ok(()),
+                    Ok(0) => return Ok(PhaseEnd::Ended),
                     Ok(n) => {
                         let bytes: Vec<u8> = keybuf[..n].to_vec();
                         self.on_keys(&bytes).await?;
                         if self.detached {
-                            return Ok(());
+                            return Ok(PhaseEnd::Detached);
+                        }
+                        if let Some(carry) = self.reclaim.take() {
+                            return Ok(PhaseEnd::Reclaim(carry));
                         }
                     }
                     Err(e) => return Err(e).context("error reading stdin"),
@@ -572,6 +710,11 @@ impl Attached {
                         if out.bells > 0 {
                             self.stdout.write_all(b"\x07").await?;
                         }
+                        if self.watching {
+                            // The app's own output may have switched mouse
+                            // reporting off; watching needs clicks.
+                            self.stdout.write_all(MOUSE_ON).await?;
+                        }
                         self.stdout.flush().await?;
                     }
                     Mode::FetchingHistory { pending, .. } => pending.push(bytes),
@@ -588,11 +731,8 @@ impl Attached {
                 }
             }
             FromSession::Title { title } => {
-                let clean: String = title.chars().filter(|c| !c.is_control()).collect();
-                self.stdout
-                    .write_all(format!("\x1b]2;{clean}\x07").as_bytes())
-                    .await?;
-                self.stdout.flush().await?;
+                self.title = Some(title);
+                self.write_title().await?;
             }
             FromSession::Exit { status } => self.exit_status = Some(status.unwrap_or(1)),
             FromSession::Error { message } => {
@@ -629,7 +769,7 @@ impl Attached {
                     pending: Vec::new(),
                     skip_replies: 0,
                 };
-                if history_next > self.history_oldest {
+                if self.fetch_history && history_next > self.history_oldest {
                     self.conn
                         .send(&ToSession::History {
                             before: history_next,
@@ -651,6 +791,9 @@ impl Attached {
                     })
                     .host_output;
                 out.extend_from_slice(&mirror.process(&snapshot).host);
+                if self.watching {
+                    out.extend_from_slice(MOUSE_ON);
+                }
                 self.stdout.write_all(&out).await?;
                 self.stdout.flush().await?;
             }
@@ -699,22 +842,30 @@ impl Attached {
         };
         let mut out = SGR_RESET.to_vec();
         out.extend_from_slice(b"\x1b[?7h"); // history lines rely on autowrap
-        out.extend_from_slice(cup(self.rows.saturating_sub(1), 0).as_bytes());
-        let mut continuation = false;
-        for line in &lines {
-            if !continuation {
-                out.extend_from_slice(b"\r\n");
+        if self.fetch_history {
+            out.extend_from_slice(cup(self.rows.saturating_sub(1), 0).as_bytes());
+            let mut continuation = false;
+            for line in &lines {
+                if !continuation {
+                    out.extend_from_slice(b"\r\n");
+                }
+                if let Ok(bytes) = protocol::decode_terminal_bytes(&line.data) {
+                    out.extend_from_slice(&bytes);
+                }
+                out.extend_from_slice(SGR_RESET);
+                continuation = line.wrapped;
             }
-            if let Ok(bytes) = protocol::decode_terminal_bytes(&line.data) {
-                out.extend_from_slice(&bytes);
-            }
-            out.extend_from_slice(SGR_RESET);
-            continuation = line.wrapped;
+            // Scroll the history clear of the bottom-anchored live region.
+            let region_rows = stream_rows.min(self.rows);
+            out.extend_from_slice(cup(self.rows.saturating_sub(1), 0).as_bytes());
+            out.extend_from_slice(&b"\r\n".repeat(usize::from(region_rows)));
+        } else {
+            // Switching between watching and holding the session: the
+            // history is already in this terminal's scrollback, so repaint
+            // from a clean screen rather than scrolling another copy of the
+            // view into it.
+            out.extend_from_slice(b"\x1b[H\x1b[2J");
         }
-        // Scroll the history clear of the bottom-anchored live region.
-        let region_rows = stream_rows.min(self.rows);
-        out.extend_from_slice(cup(self.rows.saturating_sub(1), 0).as_bytes());
-        out.extend_from_slice(&b"\r\n".repeat(usize::from(region_rows)));
 
         let mut mirror = Box::new(Mirror::new(self.rows, self.cols));
         out.extend_from_slice(
@@ -730,13 +881,68 @@ impl Attached {
         for chunk in &pending {
             out.extend_from_slice(&mirror.process(chunk).host);
         }
+        if self.watching {
+            out.extend_from_slice(MOUSE_ON);
+        }
         self.stdout.write_all(&out).await?;
         self.stdout.flush().await?;
         self.mode = Mode::Live { mirror };
+        if !self.carry.is_empty() {
+            let carry = std::mem::take(&mut self.carry);
+            self.conn
+                .send(&ToSession::Input {
+                    data: protocol::encode_terminal_bytes(&carry),
+                    delays: Vec::new(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Set this terminal's title from the session's, marked while watching.
+    async fn write_title(&mut self) -> anyhow::Result<()> {
+        let base: String = self
+            .title
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let title = if !self.watching {
+            base
+        } else if base.is_empty() {
+            "watching \u{2014} click or press a key to take control".to_string()
+        } else {
+            format!("[watching] {base} \u{2014} click or press a key to take control")
+        };
+        // The first phase leaves an untitled terminal alone; later ones
+        // always write, clearing a watching title on the way back.
+        if title.is_empty() && self.fetch_history {
+            return Ok(());
+        }
+        self.stdout
+            .write_all(format!("\x1b]2;{title}\x07").as_bytes())
+            .await?;
+        self.stdout.flush().await?;
         Ok(())
     }
 
     async fn on_keys(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        if self.watching {
+            // Any key or click takes the session back; the detach key still
+            // detaches, leaving the session to whoever holds it.
+            // Focus reports (the app may have turned them on) aren't a
+            // request for control: tabs gaining or losing focus as the user
+            // moves around must not pull the session back and forth.
+            let bytes = strip_focus_reports(bytes);
+            if self.detach_key.is_some_and(|k| bytes.contains(&k)) {
+                self.detached = true;
+                let _ = self.conn.send(&ToSession::Unview).await;
+            } else if !bytes.is_empty() {
+                self.reclaim = Some(strip_mouse_reports(&bytes));
+            }
+            return Ok(());
+        }
         let (input, detach) = match self
             .detach_key
             .and_then(|k| bytes.iter().position(|&b| b == k))
@@ -767,6 +973,48 @@ impl Attached {
         }
         Ok(())
     }
+}
+
+/// Drop mouse reports (SGR `ESC [ < b ; x ; y M/m`, X10 `ESC [ M b x y`)
+/// from input typed while watching: a click only takes the session back,
+/// it isn't forwarded, but keystrokes are.
+fn strip_mouse_reports(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if let Some(params) = rest.strip_prefix(b"\x1b[<")
+            && let Some(end) = params.iter().position(|&b| b == b'M' || b == b'm')
+            && params[..end]
+                .iter()
+                .all(|&b| b.is_ascii_digit() || b == b';')
+        {
+            i += 3 + end + 1;
+            continue;
+        }
+        if rest.starts_with(b"\x1b[M") && rest.len() >= 6 {
+            i += 6;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Drop focus-in/out reports (`ESC [ I`, `ESC [ O`) from input.
+fn strip_focus_reports(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i..], [0x1b, b'[', b'I' | b'O', ..]) {
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Typed newline-delimited-JSON framing over the session socket (the
@@ -851,6 +1099,30 @@ mod tests {
 
         let args: Vec<std::ffi::OsString> = ["a", "b"].iter().map(Into::into).collect();
         assert!(parse_attach_args(&args).is_err(), "two patterns must be rejected");
+
+        assert!(!parse_attach_args(&[]).unwrap().watch);
+        let args: Vec<std::ffi::OsString> = ["--watch", "4321"].iter().map(Into::into).collect();
+        let opts = parse_attach_args(&args).unwrap();
+        assert!(opts.watch);
+        assert_eq!(opts.pattern.as_deref(), Some("4321"));
+    }
+
+    #[test]
+    fn focus_reports_are_stripped_but_keys_kept() {
+        assert_eq!(strip_focus_reports(b"\x1b[I"), b"");
+        assert_eq!(strip_focus_reports(b"\x1b[Ohi\x1b[I"), b"hi");
+        assert_eq!(strip_focus_reports(b"\x1b[A\x1bO"), b"\x1b[A\x1bO");
+    }
+
+    #[test]
+    fn mouse_reports_are_stripped_but_keys_kept() {
+        assert_eq!(strip_mouse_reports(b"\x1b[<0;12;5M"), b"");
+        assert_eq!(strip_mouse_reports(b"\x1b[<0;12;5Mhi\x1b[<0;12;5m"), b"hi");
+        assert_eq!(strip_mouse_reports(b"\x1b[M !!x"), b"x");
+        assert_eq!(strip_mouse_reports(b"ls\r"), b"ls\r");
+        // Arrow keys and other escape sequences are keystrokes, not clicks.
+        assert_eq!(strip_mouse_reports(b"\x1b[A"), b"\x1b[A");
+        assert_eq!(strip_mouse_reports(b"\x1b[<x"), b"\x1b[<x");
     }
 
     #[test]
